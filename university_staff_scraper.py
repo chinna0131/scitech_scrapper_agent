@@ -6984,600 +6984,730 @@ async def scrape_source(
 
 
 
-# =============================================================================
-# V13 OPHTHALMOLOGY DIRECTORY OVERRIDES
-# =============================================================================
-# Adds deterministic support for:
-#   1) University Hospital Zurich (USZ) team listings with clinic_id pagination.
-#      The listing explicitly binds a person card to a clinic/service mailbox.
-#      Shared mailboxes are preserved WITH the card person's name and are not
-#      collapsed across different people.
-#   2) EyeDoctors.ie ophthalmologist listings. The directory page contains
-#      profile links but usually no person email; every doctor profile is
-#      followed and its mailto email(s) are harvested.
-#
-# These adapters run before the universal generic parser.
 
-V13_TRUSTED_ASSOC_METHODS = (
-    "usz_team_card_v13",
-    "eyedoctors_profile_v13",
+# =============================================================================
+# V14 ROBUST OPHTHALMOLOGY + FINAL DISPATCHER
+# =============================================================================
+# This section intentionally replaces V13 rather than stacking another set of
+# conflicting overrides on top of it. Earlier generic/cancer/psychiatry helpers
+# remain available, but THIS section owns the final dedupe, validation and
+# scrape_source dispatcher used by main().
+#
+# Core rules:
+#   * email is mandatory
+#   * name/country are optional
+#   * if a personal email has no trustworthy name, derive a display name from
+#     the local-part; never manufacture a person name from a shared mailbox
+#   * exact person-card/profile associations may legitimately reuse one shared
+#     service mailbox across several people
+#   * global/footer emails must never be attached to profile people
+#   * site-specific adapters run before the universal parser
+
+from urllib.parse import parse_qs, urlencode, urlunparse
+
+V14_FETCH_RETRIES = 3
+V14_FETCH_BACKOFF = (0.8, 1.6, 2.8)
+V14_PROFILE_CONCURRENCY = max(1, PROFILE_CONCURRENCY)
+V14_MAX_PROFILE_RETRIES = 2
+
+V14_TRUSTED_METHODS = (
+    'usz_card_v14',
+    'usz_profile_v14',
+    'eyedoctors_profile_v14',
 )
 
-
-def _v13_is_trusted_assoc(rec: PersonRecord) -> bool:
-    method = (rec.extraction_method or "").casefold()
-    return any(x in method for x in V13_TRUSTED_ASSOC_METHODS)
-
-
-def _v13_clean_honorific_name(value: str) -> str:
-    value = clean_text(value)
-    if not value:
-        return ""
-
-    # EyeDoctors.ie prefixes.
-    value = re.sub(
-        r"^(?:Mr|Mrs|Ms|Miss|Dr|Prof|Professor)\.?\s+",
-        "",
-        value,
-        flags=re.I,
-    )
-
-    # USZ puts credentials after a comma, e.g.
-    # 'Daniel Barthelmes, Prof. Dr. Dr. med.'
-    parts = [clean_text(x) for x in value.split(",")]
-    if len(parts) >= 2:
-        suffix = ", ".join(parts[1:]).casefold()
-        if re.search(
-            r"\b(?:pd|prof|dr|med|rer|nat|phd|msc|mph|fmh|univ)\b",
-            suffix,
-            re.I,
-        ):
-            value = parts[0]
-
-    value = clean_person_name_candidate(value)
-    return value if plausible_name(value) else ""
+V14_SHARED_LOCALPARTS = {
+    'info', 'contact', 'office', 'admin', 'administrator', 'webmaster',
+    'support', 'help', 'reception', 'secretary', 'faculty', 'staff', 'team',
+    'department', 'dept', 'editor', 'editorial', 'enquiries', 'inquiries',
+    'communications', 'media', 'augenklinik', 's.retina', 'hornhaut', 'lid',
+    'augalg', 'glaukom', 'uveitis', 'orthoptik', 'notfall', 'sekretariat',
+}
 
 
-def _v13_shared_service_email(email: str) -> bool:
+def _v14_host(url: str) -> str:
+    return urlparse(normalize_url(url)).netloc.casefold().replace('www.', '')
+
+
+def _v14_is_trusted(rec: PersonRecord) -> bool:
+    method = (rec.extraction_method or '').casefold()
+    return any(x in method for x in V14_TRUSTED_METHODS)
+
+
+def _v14_is_shared_email(email: str) -> bool:
     e = normalize_email(email)
     if not e:
         return False
-    local = e.split("@", 1)[0].casefold()
+    local = e.split('@', 1)[0].casefold()
+    if local in V14_SHARED_LOCALPARTS:
+        return True
     if is_generic_email(e) or is_strict_generic_email(e):
         return True
-    # USZ specialty/service addresses are shared even when they do not use a
-    # conventional info@/office@ prefix.
-    return local in {
-        "augenklinik", "s.retina", "hornhaut", "lid", "augalg",
-        "glaukom", "uveitis", "orthoptik", "notfall", "sekretariat",
-    }
+    return any(
+        local.startswith(prefix)
+        for prefix in (
+            'info.', 'info_', 'contact.', 'contact_', 'office.', 'office_',
+            'admin.', 'admin_', 'secretariat', 'sekretariat', 'clinic',
+            'department', 'faculty', 'team', 'service',
+        )
+    )
 
 
-def dedupe_records_v13(records: List[PersonRecord]) -> List[PersonRecord]:
+def _v14_clean_name(value: str) -> str:
+    value = clean_text(value)
+    if not value:
+        return ''
+
+    value = re.sub(
+        r'^(?:Mr|Mrs|Ms|Miss|Dr|Prof|Professor|PD)\.?\s+',
+        '', value, flags=re.I,
+    )
+
+    # Remove credentials after comma or at end while keeping the visible person.
+    parts = [clean_text(x) for x in value.split(',')]
+    if len(parts) > 1:
+        suffix = ', '.join(parts[1:]).casefold()
+        if re.search(
+            r'\b(?:pd|prof|dr|med|rer|nat|phd|msc|mph|fmh|univ|md|frcs|frcophth|facog|facs)\b',
+            suffix, re.I,
+        ):
+            value = parts[0]
+
+    value = re.sub(
+        r'(?i)(?:,|\s)+(?:MD|M\.D\.|PhD|Ph\.D\.|MSc|MPH|MBA|MBBS|FRCS(?:\([^)]+\))?|FRCOphth|FACOG|FACS)\.?\s*$',
+        '', value,
+    )
+    value = clean_person_name_candidate(value)
+    return value if plausible_name(value) else ''
+
+
+def _v14_name_from_email(email: str) -> str:
+    """User-requested fallback: derive a readable name only for personal mailboxes."""
+    e = normalize_email(email)
+    if not e or _v14_is_shared_email(e):
+        return ''
+    local = e.split('@', 1)[0].split('+', 1)[0].strip().lower()
+    if not local:
+        return ''
+
+    # Split explicit separators first.
+    parts = [p for p in re.split(r'[._\-]+', local) if p]
+    if len(parts) == 1:
+        # Compact institutional usernames are weak evidence. Still provide a
+        # last-resort display name as requested, but keep confidence lower.
+        token = re.sub(r'\d+$', '', parts[0])
+        token = re.sub(r'[^a-zà-öø-ÿā-ž]', '', token, flags=re.I)
+        if len(token) < 3:
+            return ''
+        candidate = token[:1].upper() + token[1:]
+        return candidate if plausible_name(candidate) else ''
+
+    cleaned = []
+    for token in parts:
+        token = re.sub(r'\d+$', '', token)
+        token = re.sub(r'[^a-zà-öø-ÿā-ž]', '', token, flags=re.I)
+        if not token:
+            continue
+        if len(token) == 1:
+            cleaned.append(token.upper() + '.')
+        else:
+            cleaned.append(token[:1].upper() + token[1:])
+    candidate = ' '.join(cleaned)
+    return candidate if candidate and plausible_name(candidate) else ''
+
+
+def _v14_finalize_record(rec: PersonRecord) -> Tuple[bool, str]:
+    rec.email = normalize_email(rec.email)
+    if not rec.email:
+        return False, 'missing_or_invalid_email'
+
+    cleaned = _v14_clean_name(rec.name)
+    if cleaned:
+        rec.name = cleaned
+    elif not _v14_is_shared_email(rec.email):
+        rec.name = _v14_name_from_email(rec.email)
+    else:
+        rec.name = ''
+
+    rec.email_type = 'shared/role' if _v14_is_shared_email(rec.email) else 'personal'
+
+    c = normalize_country(rec.country)
+    rec.country = c if c else ''
+
+    alts = []
+    for raw in re.split(r'[|;]+', str(rec.alternate_emails or '')):
+        e = normalize_email(raw.strip())
+        if e and e != rec.email:
+            alts.append(e)
+    rec.alternate_emails = ' | '.join(unique(alts))
+    rec.email_conflict = 'yes' if rec.email_conflict == 'yes' else 'no'
+    rec.affiliation = clean_text(rec.affiliation)[:700]
+    rec.scrape_status = 'accepted'
+    return True, ''
+
+
+def dedupe_records_v14(records: List[PersonRecord]) -> List[PersonRecord]:
     """
-    Normal records remain email-deduplicated.
-
-    For trusted explicit person-card/profile associations, shared mailboxes may
-    legitimately occur for several people. Keep (email, person) pairs instead
-    of collapsing every person to one arbitrary row.
+    Deduplication strategy:
+      * explicit person/profile associations => profile+email or name+email
+      * shared service email may remain for several people
+      * normal generic records => email key
+      * profile placeholders => profile key
     """
     merged: Dict[Tuple, PersonRecord] = {}
 
     for rec in records:
-        email = normalize_email(rec.email)
-        if email:
-            rec.email = email
+        rec.email = normalize_email(rec.email)
+        purl = normalize_url(rec.profile_url).casefold()
+        nkey = normalize_name_key(rec.name) or clean_text(rec.name).casefold()
+        trusted = _v14_is_trusted(rec)
+        shared = _v14_is_shared_email(rec.email) if rec.email else False
 
-        if email and _v13_is_trusted_assoc(rec) and rec.name:
-            name_key = normalize_name_key(rec.name) or clean_text(rec.name).casefold()
-            key = ("email_name_v13", email, name_key)
-        elif email:
-            key = ("email", email)
-        elif rec.profile_url:
-            key = ("profile", normalize_url(rec.profile_url).casefold())
+        if rec.email and purl and trusted:
+            key = ('profile_email', purl, rec.email)
+        elif rec.email and nkey and (trusted or shared):
+            key = ('name_email', nkey, rec.email)
+        elif rec.email:
+            key = ('email', rec.email)
+        elif purl:
+            key = ('profile', purl)
         else:
-            key = (
-                "name",
-                normalize_name_key(rec.name),
-                urlparse(rec.source_url).netloc.casefold(),
-            )
+            key = ('name_source', nkey, normalize_url(rec.source_url).casefold())
 
         if key not in merged:
             merged[key] = rec
             continue
 
         cur = merged[key]
+        # Prefer stronger human name / profile data.
+        if (not _v14_clean_name(cur.name)) and _v14_clean_name(rec.name):
+            cur.name = rec.name
+        if not cur.profile_url and rec.profile_url:
+            cur.profile_url = rec.profile_url
+        if not cur.country and rec.country:
+            cur.country = rec.country
+            cur.country_source = rec.country_source
+
         for field_name in COLUMNS:
             if not hasattr(cur, field_name) or not hasattr(rec, field_name):
                 continue
             old = getattr(cur, field_name)
             new = getattr(rec, field_name)
-            if field_name == "confidence":
+            if field_name == 'confidence':
                 cur.confidence = max(int(cur.confidence or 0), int(rec.confidence or 0))
-            elif field_name == "alternate_emails":
+            elif field_name == 'alternate_emails':
                 vals = []
                 for part in (old, new):
-                    vals.extend([x.strip() for x in str(part or "").split("|") if x.strip()])
-                cur.alternate_emails = " | ".join(unique(vals))
+                    vals.extend([x.strip() for x in re.split(r'[|;]+', str(part or '')) if x.strip()])
+                cur.alternate_emails = ' | '.join(unique([
+                    normalize_email(x) for x in vals
+                    if normalize_email(x) and normalize_email(x) != normalize_email(cur.email)
+                ]))
             elif not old and new:
                 setattr(cur, field_name, new)
 
-        methods = unique([
-            x for x in (cur.extraction_method, rec.extraction_method) if x
-        ])
-        cur.extraction_method = "+".join(methods)
+        methods = unique([x for x in (cur.extraction_method, rec.extraction_method) if x])
+        cur.extraction_method = '+'.join(methods)
 
     return list(merged.values())
 
 
-# Override global dedupe so main/master export also preserves explicit USZ
-# shared-email/person associations.
-dedupe_records = dedupe_records_v13
+# Make main()/generic downstream use the final deduper.
+dedupe_records = dedupe_records_v14
+validate_record = _v14_finalize_record
 
 
 # -----------------------------------------------------------------------------
-# V13 fetch helpers
+# Robust fetch cascade
 # -----------------------------------------------------------------------------
 
-async def _v13_http_then_browser(context, urls: List[str]) -> Dict:
-    """Try several equivalent URLs. HTTP first, browser second."""
-    seen = set()
-    candidates = []
-    for u in urls:
-        u = normalize_url(u)
-        if u and u not in seen:
-            seen.add(u)
-            candidates.append(u)
+async def _v14_context_request_fetch(context, url: str) -> Dict:
+    """Playwright APIRequestContext fallback; avoids page.goto networking quirks."""
+    try:
+        response = await context.request.get(
+            url,
+            timeout=max(PLAYWRIGHT_TIMEOUT, 30000),
+            fail_on_status_code=False,
+            headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': url,
+            },
+        )
+        status = response.status
+        text = await response.text()
+        if status >= 400:
+            return {'ok': False, 'error': f'context.request HTTP {status}', 'html': text, 'url': url}
+        if len(text or '') < 250:
+            return {'ok': False, 'error': 'context.request HTML too small', 'html': text, 'url': url}
+        low = text.casefold()
+        if any(x in low for x in ('verify you are human', 'captcha', 'access denied', 'checking your browser')):
+            return {'ok': False, 'error': 'context.request anti-bot page', 'html': text, 'url': url}
+        return {'ok': True, 'error': '', 'html': text, 'url': url}
+    except Exception as exc:
+        return {'ok': False, 'error': f'context.request: {exc}', 'html': '', 'url': url}
 
-    last = {"ok": False, "error": "no candidate URL", "html": "", "url": urls[0] if urls else ""}
 
-    for u in candidates:
-        r = await fetch_http(u)
-        if r.get("ok"):
+async def _v14_browser_fetch(context, url: str) -> Dict:
+    last_error = ''
+    waits = ('domcontentloaded', 'commit')
+    for attempt in range(V14_FETCH_RETRIES):
+        page = await context.new_page()
+        try:
+            wait_until = waits[min(attempt, len(waits)-1)]
+            response = await page.goto(
+                url,
+                wait_until=wait_until,
+                timeout=max(PLAYWRIGHT_TIMEOUT, 30000),
+            )
+            try:
+                await page.wait_for_selector('body', timeout=8000)
+            except Exception:
+                pass
+            await dismiss_popups(page)
+            await auto_scroll(page)
+            await click_load_more(page)
+            await page.wait_for_timeout(500)
+            html = await page.content()
+            status = response.status if response else 200
+            if status >= 400:
+                last_error = f'HTTP {status}'
+            elif len(html or '') >= 250:
+                return {'ok': True, 'error': '', 'html': html, 'url': page.url or url}
+            else:
+                last_error = 'rendered HTML too small'
+        except Exception as exc:
+            last_error = str(exc)
+        finally:
+            await page.close()
+
+        await asyncio.sleep(V14_FETCH_BACKOFF[min(attempt, len(V14_FETCH_BACKOFF)-1)])
+
+    return {'ok': False, 'error': last_error or 'browser fetch failed', 'html': '', 'url': url}
+
+
+async def fetch_robust_v14(context, urls) -> Dict:
+    if isinstance(urls, str):
+        urls = [urls]
+    candidates = unique([normalize_url(x) for x in urls if normalize_url(x)])
+    last = {'ok': False, 'error': 'no candidate URL', 'html': '', 'url': candidates[0] if candidates else ''}
+
+    for url in candidates:
+        for attempt in range(V14_FETCH_RETRIES):
+            r = await fetch_http(url)
+            if r.get('ok'):
+                return r
+            last = r
+            if attempt < V14_FETCH_RETRIES - 1:
+                await asyncio.sleep(V14_FETCH_BACKOFF[min(attempt, len(V14_FETCH_BACKOFF)-1)])
+
+    for url in candidates:
+        r = await _v14_context_request_fetch(context, url)
+        if r.get('ok'):
             return r
         last = r
 
-    for u in candidates:
-        r = await playwright_fetch(context, u)
-        if r.get("ok"):
+    for url in candidates:
+        r = await _v14_browser_fetch(context, url)
+        if r.get('ok'):
             return r
         last = r
 
     return last
 
 
-def _v13_usz_url_variants(source_url: str, cpage: Optional[int] = None) -> List[str]:
-    p = urlparse(source_url)
-    from urllib.parse import parse_qs, urlencode, urlunparse
+# -----------------------------------------------------------------------------
+# USZ
+# -----------------------------------------------------------------------------
 
+def _v14_is_usz(url: str) -> bool:
+    p = urlparse(url)
+    return _v14_host(url) == 'usz.ch' and p.path.rstrip('/').casefold() == '/team'
+
+
+def _v14_usz_page_urls(source_url: str, page_no: int) -> List[str]:
+    p = urlparse(source_url)
     qs = parse_qs(p.query, keep_blank_values=True)
-    clinic_id = (qs.get("clinic_id") or [""])[0]
+    clinic_id = clean_text((qs.get('clinic_id') or [''])[0])
     if not clinic_id:
         return [source_url]
 
-    page = cpage
-    if page is None:
-        try:
-            page = int((qs.get("cpage") or ["1"])[0] or 1)
-        except Exception:
-            page = 1
-
-    # PHP/WordPress endpoint is more stable with the full set of expected query
-    # keys present. Keep the exact original as the first attempt.
     canonical_qs = {
-        "search": "",
-        "letter": "",
-        "vested_interests": "",
-        "clinic_id": clinic_id,
-        "cpage": str(max(1, int(page))),
+        'search': '',
+        'letter': '',
+        'vested_interests': '',
+        'clinic_id': clinic_id,
+        'cpage': str(max(1, int(page_no))),
     }
     canonical = urlunparse((
-        p.scheme or "https",
-        p.netloc,
-        p.path or "/team/",
-        "",
-        urlencode(canonical_qs),
-        "",
+        p.scheme or 'https', p.netloc, p.path or '/team/', '',
+        urlencode(canonical_qs), ''
     ))
-
-    amp_style = (
+    amp = (
         f"{p.scheme or 'https'}://{p.netloc}{p.path or '/team/'}"
-        f"?search&letter&vested_interests&clinic_id={clinic_id}&cpage={max(1, int(page))}"
+        f"?search&letter&vested_interests&clinic_id={clinic_id}&cpage={max(1, int(page_no))}"
     )
-
-    return unique([source_url, canonical, amp_style])
-
-
-# -----------------------------------------------------------------------------
-# USZ TEAM
-# -----------------------------------------------------------------------------
-
-def _v13_is_usz_team(url: str) -> bool:
-    p = urlparse(url)
-    return p.netloc.casefold().replace("www.", "") == "usz.ch" and p.path.rstrip("/").casefold() == "/team"
+    original = source_url if page_no == 1 else ''
+    return unique([original, canonical, amp])
 
 
-def parse_usz_team_page_v13(html: str, source_url: str) -> Tuple[List[PersonRecord], List[str]]:
-    soup = BeautifulSoup(html, "html.parser")
+def _v14_usz_parse(html: str, source_url: str) -> Tuple[List[PersonRecord], List[int]]:
+    soup = BeautifulSoup(html, 'html.parser')
     records: List[PersonRecord] = []
-    pagination_urls: List[str] = []
+    pages = set()
 
-    for card in soup.select("div.person.list-item, .listing-elements .person, .person.list-item"):
-        name_el = card.select_one(".person-name")
-        name = _v13_clean_honorific_name(
-            name_el.get_text(" ", strip=True) if name_el else ""
-        )
+    for a in soup.select('a[href*="cpage="]'):
+        try:
+            q = parse_qs(urlparse(urljoin(source_url, a.get('href', ''))).query, keep_blank_values=True)
+            n = int((q.get('cpage') or [''])[0])
+            if n > 0:
+                pages.add(n)
+        except Exception:
+            pass
+
+    for card in soup.select('div.person.list-item, .listing-elements .person, .person.list-item'):
+        name_el = card.select_one('.person-name')
+        raw_name = clean_text(name_el.get_text(' ', strip=True) if name_el else '')
+        name = _v14_clean_name(raw_name)
         if not name:
             continue
 
-        profile_url = ""
+        profile_url = ''
         if name_el:
-            a = name_el.select_one("a[href]")
+            a = name_el.select_one('a[href]')
             if a:
-                profile_url = normalize_url(urljoin(source_url, a.get("href", "")))
+                profile_url = normalize_url(urljoin(source_url, a.get('href', '')))
 
-        position_el = card.select_one(".person-positions")
-        position = clean_text(position_el.get_text(" ", strip=True)) if position_el else ""
+        position = clean_text((card.select_one('.person-positions') or card).get_text(' ', strip=True))
+        if card.select_one('.person-positions'):
+            position = clean_text(card.select_one('.person-positions').get_text(' ', strip=True))
+        specialty_el = card.select_one('.person-specialities .value')
+        specialty = clean_text(specialty_el.get_text(' ', strip=True)) if specialty_el else ''
 
-        specialty_el = card.select_one(".person-specialities .value")
-        specialty = clean_text(specialty_el.get_text(" ", strip=True)) if specialty_el else ""
-
-        phone = ""
-        for row in card.select(".contact-box > div"):
-            label = clean_text((row.select_one(".label") or row).get_text(" ", strip=True)).casefold()
-            if label.startswith("tel"):
-                value = row.select_one(".value")
-                phone = clean_text(value.get_text(" ", strip=True) if value else row.get_text(" ", strip=True))
-                phone = re.sub(r"(?i)^tel\.?\s*", "", phone).strip()
+        phone = ''
+        for row in card.select('.contact-box > div'):
+            label_el = row.select_one('.label')
+            label = clean_text(label_el.get_text(' ', strip=True) if label_el else '').casefold()
+            if label.startswith('tel'):
+                value_el = row.select_one('.value')
+                phone = clean_text(value_el.get_text(' ', strip=True) if value_el else row.get_text(' ', strip=True))
                 break
 
         emails = []
         for a in card.select('a[href^="mailto:"], a[href^="MAILTO:"]'):
-            e = normalize_email(a.get("href", "")) or normalize_email(a.get_text(" ", strip=True))
+            e = normalize_email(a.get('href', '')) or normalize_email(a.get_text(' ', strip=True))
             if e:
                 emails.append(e)
         emails = unique(emails)
 
         for email in emails:
-            shared = _v13_shared_service_email(email)
-            rec = PersonRecord(
+            records.append(PersonRecord(
                 name=name,
                 email=email,
-                country="Switzerland",
-                country_source="site_adapter",
-                email_type="shared/role" if shared else "personal",
-                email_conflict="no",
-                page_type="UNIVERSITY_DIRECTORY",
+                country='Switzerland',
+                country_source='site_adapter',
+                email_type='shared/role' if _v14_is_shared_email(email) else 'personal',
+                email_conflict='no',
+                page_type='UNIVERSITY_DIRECTORY',
                 academic_title=position,
                 specialty=specialty,
-                affiliation="University Hospital Zurich (USZ), Department of Ophthalmology",
-                university="University Hospital Zurich (USZ)",
-                department="Ophthalmology",
+                affiliation='University Hospital Zurich (USZ), Department of Ophthalmology',
+                university='University Hospital Zurich (USZ)',
+                department='Ophthalmology',
                 phone=phone,
                 profile_url=profile_url,
                 source_url=source_url,
-                confidence=96,
-                extraction_method="usz_team_card_v13",
-                scrape_status="accepted",
-            )
-            records.append(rec)
+                confidence=99,
+                extraction_method='usz_card_v14',
+                scrape_status='accepted',
+            ))
 
-    for a in soup.select('.listing-pagination a[href*="cpage="], a.pagination-item[href*="cpage="]'):
-        u = normalize_url(urljoin(source_url, a.get("href", "")))
-        if u:
-            pagination_urls.append(u)
-
-    return dedupe_records_v13(records), unique(pagination_urls)
+    return dedupe_records_v14(records), sorted(pages)
 
 
-async def scrape_usz_team_v13(
-    context,
-    source_url: str,
-    profile_sem: asyncio.Semaphore,
-    errors: List[Dict],
-) -> List[PersonRecord]:
-    print("   [V13] USZ team cards + cpage pagination", flush=True)
+def _v14_usz_profile_emails(html: str, profile_url: str, source_url: str, name_hint: str) -> List[PersonRecord]:
+    """Harvest profile-local emails only; footer/nav is removed first."""
+    soup = BeautifulSoup(html, 'html.parser')
+    normalize_dom(soup)
+    root = soup.select_one('main') or soup.select_one('article') or soup.select_one('#content') or soup.body or soup
+    name = _v14_clean_name((root.select_one('h1') or root.select_one('.person-name') or root).get_text(' ', strip=True))
+    if not name:
+        name = _v14_clean_name(name_hint)
 
-    # Queue page numbers rather than equivalent URL strings so page 1 is never
-    # fetched repeatedly through three canonical variants.
-    from urllib.parse import parse_qs
-    source_qs = parse_qs(urlparse(source_url).query, keep_blank_values=True)
-    try:
-        first_page = int((source_qs.get("cpage") or ["1"])[0] or 1)
-    except Exception:
-        first_page = 1
-    first_page = max(1, first_page)
+    records = []
+    seen = set()
+    for a in root.select('a[href^="mailto:"], a[href^="MAILTO:"]'):
+        email = normalize_email(a.get('href', '')) or normalize_email(a.get_text(' ', strip=True))
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        block = _nearest_person_container(a, email, max_chars=1200)
+        text = clean_text(block.get_text(' ', strip=True))
+        # Reject obvious administrative/global context unless the listing itself
+        # already used the same address for this person.
+        low = text.casefold()
+        if any(x in low for x in ('media contact', 'webmaster', 'general information')):
+            continue
+        records.append(PersonRecord(
+            name=name,
+            email=email,
+            country='Switzerland',
+            country_source='site_adapter',
+            email_type='shared/role' if _v14_is_shared_email(email) else 'personal',
+            page_type='UNIVERSITY_DIRECTORY',
+            affiliation='University Hospital Zurich (USZ), Department of Ophthalmology',
+            university='University Hospital Zurich (USZ)',
+            department='Ophthalmology',
+            phone=extract_phone(block),
+            profile_url=profile_url,
+            source_url=source_url,
+            confidence=97,
+            extraction_method='usz_profile_v14',
+        ))
+    return dedupe_records_v14(records)
 
-    queue = [first_page]
-    queued_pages = {first_page}
-    visited_pages = set()
+
+async def scrape_usz_v14(context, source_url: str, profile_sem: asyncio.Semaphore, errors: List[Dict]) -> List[PersonRecord]:
+    print('   [V14] USZ cards + explicit cpage crawl + optional profile enrichment', flush=True)
+    queue = [1]
+    queued = {1}
+    visited = set()
     records: List[PersonRecord] = []
+    profile_hints: Dict[str, str] = {}
     successful_pages = 0
 
-    while queue and len(visited_pages) < MAX_PAGES_PER_URL:
-        cpage = queue.pop(0)
-        if cpage in visited_pages:
+    while queue and len(visited) < MAX_PAGES_PER_URL:
+        page_no = queue.pop(0)
+        if page_no in visited:
             continue
-        visited_pages.add(cpage)
+        visited.add(page_no)
 
-        variants = _v13_usz_url_variants(source_url, cpage)
-        requested = variants[0] if variants else source_url
-        r = await _v13_http_then_browser(context, variants)
-        if not r.get("ok"):
+        r = await fetch_robust_v14(context, _v14_usz_page_urls(source_url, page_no))
+        if not r.get('ok'):
             errors.append({
-                "type": "usz_page_fetch_failed",
-                "source_url": source_url,
-                "page": cpage,
-                "page_url": requested,
-                "error": excel_safe(r.get("error", "")),
+                'type': 'usz_page_fetch_failed', 'source_url': source_url,
+                'page': page_no, 'error': excel_safe(r.get('error', '')),
             })
             continue
 
         successful_pages += 1
-        page_records, page_links = parse_usz_team_page_v13(r["html"], source_url)
+        page_records, page_numbers = _v14_usz_parse(r['html'], source_url)
         records.extend(page_records)
-        records = dedupe_records_v13(records)
+        for rec in page_records:
+            if rec.profile_url and rec.name:
+                profile_hints[rec.profile_url] = rec.name
 
-        # Add every pagination page, not only text-based Next links. The USZ
-        # next arrow has no useful text and was missed by the old generic logic.
-        for u in page_links:
-            qs = parse_qs(urlparse(u).query, keep_blank_values=True)
-            try:
-                page_no = int((qs.get("cpage") or [""])[0])
-            except Exception:
-                continue
-            if page_no <= 0 or page_no in visited_pages or page_no in queued_pages:
-                continue
-            queued_pages.add(page_no)
-            queue.append(page_no)
+        for n in page_numbers:
+            if n not in visited and n not in queued and n <= MAX_PAGES_PER_URL:
+                queued.add(n)
+                queue.append(n)
 
-        print(
-            f"   [USZ PAGE] cpage={cpage} cards={len(page_records)} total={len(records)}",
-            flush=True,
-        )
+        print(f'   [USZ PAGE] {page_no}: records={len(page_records)} discovered_pages={page_numbers}', flush=True)
         await polite_delay()
 
-    if successful_pages == 0:
-        errors.append({
-            "type": "fetch_failed",
-            "source_url": source_url,
-            "error": "USZ listing failed for original and canonical pagination URL variants.",
-        })
+    # Profile enrichment is best-effort and never removes listing-card records.
+    async def profile_one(url: str, name: str):
+        async with profile_sem:
+            r = await fetch_robust_v14(context, [url])
+            if not r.get('ok'):
+                return []
+            return _v14_usz_profile_emails(r['html'], url, source_url, name)
 
+    if profile_hints:
+        results = await asyncio.gather(*(profile_one(u, n) for u, n in profile_hints.items()))
+        for recs in results:
+            records.extend(recs)
+
+    records = dedupe_records_v14(records)
     errors.append({
-        "type": "email_coverage_summary",
-        "source_url": source_url,
-        "adapter": "usz_team_v13",
-        "pages_fetched": successful_pages,
-        "final_records": len(records),
-        "final_unique_emails": len({normalize_email(x.email) for x in records if normalize_email(x.email)}),
+        'type': 'email_coverage_summary',
+        'source_url': source_url,
+        'adapter': 'usz_v14',
+        'pages_fetched': successful_pages,
+        'profiles_discovered': len(profile_hints),
+        'final_people_rows': len(records),
+        'final_unique_emails': len({r.email for r in records if r.email}),
     })
     return records
 
 
 # -----------------------------------------------------------------------------
-# EYEDOCTORS.IE
+# EyeDoctors.ie
 # -----------------------------------------------------------------------------
 
-def _v13_is_eyedoctors(url: str) -> bool:
+def _v14_is_eyedoctors(url: str) -> bool:
     p = urlparse(url)
-    host = p.netloc.casefold().replace("www.", "")
-    return host == "eyedoctors.ie" and "/opthalmologists/" in p.path.casefold()
+    return _v14_host(url) == 'eyedoctors.ie' and '/opthalmologists/' in p.path.casefold()
 
 
-def _v13_is_eyedoctors_profile(url: str) -> bool:
-    p = urlparse(url)
-    return _v13_is_eyedoctors(url) and bool(
-        re.search(r"/opthalmologists/doctor/\d+/[^/]+/?$", p.path, re.I)
+def _v14_is_eyedoctors_profile(url: str) -> bool:
+    return _v14_is_eyedoctors(url) and bool(
+        re.search(r'/opthalmologists/doctor/\d+/[^/]+/?$', urlparse(url).path, re.I)
     )
 
 
-def discover_eyedoctors_profiles_v13(html: str, source_url: str) -> List[Tuple[str, str]]:
-    soup = BeautifulSoup(html, "html.parser")
+def discover_eyedoctors_profiles_v14(html: str, source_url: str) -> List[Tuple[str, str]]:
+    soup = BeautifulSoup(html, 'html.parser')
     found: Dict[str, str] = {}
     for a in soup.select('a[href*="/opthalmologists/doctor/"]'):
-        href = normalize_url(urljoin(source_url, a.get("href", "")))
-        if not _v13_is_eyedoctors_profile(href):
+        url = normalize_url(urljoin(source_url, a.get('href', '')))
+        if not _v14_is_eyedoctors_profile(url):
             continue
-        name = _v13_clean_honorific_name(a.get_text(" ", strip=True))
+        name = _v14_clean_name(a.get_text(' ', strip=True))
         if not name:
-            title = clean_text(a.get("title", ""))
-            m = re.search(r"See\s+(.+?)(?:'s|’s)\s+record", title, re.I)
+            title = clean_text(a.get('title', ''))
+            m = re.search(r'See\s+(.+?)(?:\'s|’s)\s+record', title, re.I)
             if m:
-                name = _v13_clean_honorific_name(m.group(1))
-        if href not in found or (name and not found[href]):
-            found[href] = name
+                name = _v14_clean_name(m.group(1))
+        if url not in found or (name and not found[url]):
+            found[url] = name
     return list(found.items())
 
 
-def _v13_dt_dd_map(root: Tag) -> List[Tuple[str, Tag]]:
-    pairs = []
-    for dt in root.select("dt"):
-        dd = dt.find_next_sibling("dd")
+def _v14_dt_dd_pairs(root: Tag) -> List[Tuple[str, Tag]]:
+    out = []
+    for dt in root.select('dt'):
+        dd = dt.find_next_sibling('dd')
         if dd:
-            pairs.append((clean_text(dt.get_text(" ", strip=True)), dd))
-    return pairs
+            out.append((clean_text(dt.get_text(' ', strip=True)), dd))
+    return out
 
 
-def parse_eyedoctors_profile_v13(
-    html: str,
-    profile_url: str,
-    source_url: str,
-    name_hint: str = "",
-) -> List[PersonRecord]:
-    soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("#details") or soup.select_one("main") or soup.body or soup
+def parse_eyedoctors_profile_v14(html: str, profile_url: str, source_url: str, name_hint: str = '') -> List[PersonRecord]:
+    soup = BeautifulSoup(html, 'html.parser')
+    # IMPORTANT: restrict to member-details. This prevents footer info@eyedoctors.ie
+    # from being attached to every doctor.
+    details = soup.select_one('#details dl.member-details') or soup.select_one('dl.member-details')
+    if details is None:
+        return []
 
-    h1 = root.select_one("h1")
-    name = _v13_clean_honorific_name(h1.get_text(" ", strip=True) if h1 else name_hint)
+    root = soup.select_one('#details') or details.parent or details
+    h1 = root.select_one('h1')
+    name = _v14_clean_name(h1.get_text(' ', strip=True) if h1 else name_hint)
     if not name:
-        name = _v13_clean_honorific_name(name_hint)
+        name = _v14_clean_name(name_hint)
 
-    specialty_parts = []
-    room_parts = []
-    room_nodes = []
-    for label, dd in _v13_dt_dd_map(root):
+    specialty = []
+    contact_nodes: List[Tag] = []
+    for label, dd in _v14_dt_dd_pairs(details):
         low = label.casefold()
-        text = clean_text(dd.get_text(" ", strip=True))
-        if "sub-specialty" in low or "sub specialty" in low or "specialty" in low:
+        text = clean_text(dd.get_text(' ', strip=True))
+        if 'sub-specialty' in low or 'sub specialty' in low or 'specialty' in low:
             if text:
-                specialty_parts.append(text)
-        if "private rooms" in low or "practice" in low:
-            if text:
-                room_parts.append(text)
-            room_nodes.append(dd)
+                specialty.append(text)
+        if 'private rooms' in low or 'practice' in low or 'clinic' in low:
+            contact_nodes.append(dd)
 
-    # Prefer email(s) from the private-room DDs. Fall back to the member detail
-    # block if the site changes its labels.
-    search_nodes = room_nodes or [root]
-    emails = []
-    email_node: Dict[str, Tag] = {}
-    for node in search_nodes:
+    # Email MUST come from member-details, preferably private-room/practice DD.
+    nodes = contact_nodes or [details]
+    email_map: Dict[str, Tag] = {}
+    for node in nodes:
         for a in node.select('a[href^="mailto:"], a[href^="MAILTO:"]'):
-            e = normalize_email(a.get("href", "")) or normalize_email(a.get_text(" ", strip=True))
-            if e and e not in emails:
-                emails.append(e)
-                email_node[e] = node
+            e = normalize_email(a.get('href', '')) or normalize_email(a.get_text(' ', strip=True))
+            if e:
+                email_map[e] = node
 
-    # Some profiles may have a plain visible email without mailto.
-    if not emails:
-        for node in search_nodes:
-            for e in extract_text_emails(clean_text(node.get_text(" ", strip=True))):
-                if e not in emails:
-                    emails.append(e)
-                    email_node[e] = node
+    # Plain visible email fallback, still constrained to member-details nodes.
+    if not email_map:
+        for node in nodes:
+            for e in extract_text_emails(clean_text(node.get_text(' ', strip=True))):
+                email_map[e] = node
 
     records = []
-    for email in emails:
-        node = email_node.get(email) or root
+    for email, node in email_map.items():
+        text = clean_text(node.get_text(' ', strip=True))
         phone = extract_phone(node)
-        affiliation = clean_text(node.get_text(" ", strip=True))
-        affiliation = re.sub(r"(?i)\bEmail\s*:\s*\S+", " ", affiliation)
+        # Remove labels but preserve practice name/address.
+        affiliation = re.sub(r'(?i)\bEmail\s*:\s*\S+', ' ', text)
+        affiliation = re.sub(r'(?i)\bTel\s*:\s*[^W]+(?=Web:|Email:|$)', ' ', affiliation)
         affiliation = clean_text(affiliation)[:700]
 
-        rec = PersonRecord(
+        records.append(PersonRecord(
             name=name,
             email=email,
-            country="Ireland",
-            country_source="site_adapter",
-            email_type="shared/role" if _v13_shared_service_email(email) else "personal",
-            email_conflict="no",
-            page_type="UNIVERSITY_DIRECTORY",
-            specialty="; ".join(unique(specialty_parts)),
+            country='Ireland',
+            country_source='site_adapter',
+            email_type='shared/role' if _v14_is_shared_email(email) else 'personal',
+            email_conflict='no',
+            page_type='UNIVERSITY_DIRECTORY',
+            specialty='; '.join(unique(specialty)),
             affiliation=affiliation,
             phone=phone,
             profile_url=profile_url,
             source_url=source_url,
-            confidence=99 if name else 92,
-            extraction_method="eyedoctors_profile_v13",
-            scrape_status="accepted",
-        )
-        records.append(rec)
+            confidence=100 if name else 93,
+            extraction_method='eyedoctors_profile_v14',
+            scrape_status='accepted',
+        ))
 
-    return dedupe_records_v13(records)
+    return dedupe_records_v14(records)
 
 
-async def scrape_eyedoctors_v13(
-    context,
-    source_url: str,
-    profile_sem: asyncio.Semaphore,
-    errors: List[Dict],
-) -> List[PersonRecord]:
-    print("   [V13] EyeDoctors.ie list -> every doctor profile", flush=True)
+async def scrape_eyedoctors_v14(context, source_url: str, profile_sem: asyncio.Semaphore, errors: List[Dict]) -> List[PersonRecord]:
+    print('   [V14] EyeDoctors listing -> every doctor profile -> member-details email only', flush=True)
 
-    if _v13_is_eyedoctors_profile(source_url):
-        profile_items = [(source_url, "")]
+    if _v14_is_eyedoctors_profile(source_url):
+        items = [(source_url, '')]
     else:
-        listing = await _v13_http_then_browser(context, [source_url])
-        if not listing.get("ok"):
-            errors.append({
-                "type": "fetch_failed",
-                "source_url": source_url,
-                "error": excel_safe(listing.get("error", "")),
-            })
+        listing = await fetch_robust_v14(context, [source_url])
+        if not listing.get('ok'):
+            errors.append({'type': 'fetch_failed', 'source_url': source_url, 'error': excel_safe(listing.get('error', ''))})
             return []
-        profile_items = discover_eyedoctors_profiles_v13(listing["html"], listing.get("url") or source_url)
+        items = discover_eyedoctors_profiles_v14(listing['html'], listing.get('url') or source_url)
 
-    print(f"   [EYEDOCTORS] profiles_discovered={len(profile_items)}", flush=True)
+    print(f'   [EYEDOCTORS] profiles_discovered={len(items)}', flush=True)
 
     async def one(profile_url: str, name_hint: str):
         async with profile_sem:
-            r = await _v13_http_then_browser(context, [profile_url])
-            if not r.get("ok"):
-                return [], {
-                    "type": "profile_fetch_failed",
-                    "source_url": source_url,
-                    "profile_url": profile_url,
-                    "name": name_hint,
-                    "error": excel_safe(r.get("error", "")),
-                }
-            recs = parse_eyedoctors_profile_v13(
-                r["html"], profile_url, source_url, name_hint
-            )
-            if not recs:
-                return [], {
-                    "type": "profile_no_verified_email",
-                    "source_url": source_url,
-                    "profile_url": profile_url,
-                    "name": name_hint,
-                }
-            return recs, None
+            last_error = ''
+            for attempt in range(V14_MAX_PROFILE_RETRIES):
+                r = await fetch_robust_v14(context, [profile_url])
+                if r.get('ok'):
+                    recs = parse_eyedoctors_profile_v14(r['html'], profile_url, source_url, name_hint)
+                    if recs:
+                        return recs, None
+                    return [], {
+                        'type': 'profile_no_verified_email', 'source_url': source_url,
+                        'profile_url': profile_url, 'name': name_hint,
+                    }
+                last_error = r.get('error', '')
+                await asyncio.sleep(0.8 * (attempt + 1))
+            return [], {
+                'type': 'profile_fetch_failed', 'source_url': source_url,
+                'profile_url': profile_url, 'name': name_hint, 'error': excel_safe(last_error),
+            }
 
-    # Keep concurrency intentionally small (PROFILE_CONCURRENCY) so the site is
-    # not hammered while still allowing the full directory to complete.
-    results = await asyncio.gather(*(one(u, n) for u, n in profile_items))
-
+    results = await asyncio.gather(*(one(u, n) for u, n in items))
     records: List[PersonRecord] = []
-    for recs, diagnostic in results:
+    no_email = 0
+    fetch_failed = 0
+    for recs, diag in results:
         records.extend(recs)
-        if diagnostic:
-            errors.append(diagnostic)
+        if diag:
+            errors.append(diag)
+            if diag['type'] == 'profile_no_verified_email':
+                no_email += 1
+            elif diag['type'] == 'profile_fetch_failed':
+                fetch_failed += 1
 
-    records = dedupe_records_v13(records)
+    records = dedupe_records_v14(records)
     errors.append({
-        "type": "email_coverage_summary",
-        "source_url": source_url,
-        "adapter": "eyedoctors_v13",
-        "profiles_discovered": len(profile_items),
-        "profiles_with_email": len({x.profile_url for x in records if x.profile_url}),
-        "final_records": len(records),
-        "final_unique_emails": len({normalize_email(x.email) for x in records if normalize_email(x.email)}),
+        'type': 'email_coverage_summary',
+        'source_url': source_url,
+        'adapter': 'eyedoctors_v14',
+        'profiles_discovered': len(items),
+        'profiles_with_email': len({r.profile_url for r in records if r.profile_url}),
+        'profiles_without_email': no_email,
+        'profile_fetch_failed': fetch_failed,
+        'final_people_rows': len(records),
+        'final_unique_emails': len({r.email for r in records if r.email}),
     })
     return records
 
 
 # -----------------------------------------------------------------------------
-# V13 validation / final dispatcher
+# Final dispatcher
 # -----------------------------------------------------------------------------
-
-def validate_record_v13(r: PersonRecord) -> Tuple[bool, str]:
-    r.email = normalize_email(r.email)
-    if not r.email:
-        return False, "missing_or_invalid_email"
-
-    if _v13_is_trusted_assoc(r):
-        # These adapters establish the association from the exact person card or
-        # exact doctor profile. A shared clinic/service mailbox therefore keeps
-        # the person's name instead of being blanked by V12 generic safety logic.
-        name = _v13_clean_honorific_name(r.name)
-        r.name = name if name and plausible_name(name) else ""
-        r.country = normalize_country(r.country)
-        if _v13_shared_service_email(r.email):
-            r.email_type = "shared/role"
-        else:
-            r.email_type = "personal"
-        r.alternate_emails = " | ".join(unique([
-            normalize_email(x.strip())
-            for x in str(r.alternate_emails or "").split("|")
-            if normalize_email(x.strip()) and normalize_email(x.strip()) != r.email
-        ]))
-        return True, ""
-
-    return validate_record_v12(r)
-
-
-validate_record = validate_record_v13
-
 
 async def scrape_source(
     context,
@@ -7587,110 +7717,75 @@ async def scrape_source(
     profile_sem: asyncio.Semaphore,
     errors: List[Dict],
 ) -> List[PersonRecord]:
-    """V13 final dispatcher."""
-    print(f"\n   [SOURCE] {source_url}", flush=True)
+    print(f'\n   [SOURCE] {source_url}', flush=True)
 
-    if _v13_is_usz_team(source_url):
-        records = await scrape_usz_team_v13(
-            context, source_url, profile_sem, errors
-        )
+    if _v14_is_usz(source_url):
+        records = await scrape_usz_v14(context, source_url, profile_sem, errors)
 
-    elif _v13_is_eyedoctors(source_url):
-        records = await scrape_eyedoctors_v13(
-            context, source_url, profile_sem, errors
-        )
+    elif _v14_is_eyedoctors(source_url):
+        records = await scrape_eyedoctors_v14(context, source_url, profile_sem, errors)
 
     elif _is_jhmi_cancer(source_url):
-        print("   [ADAPTER] Johns Hopkins Radiation Oncology", flush=True)
-        records = await scrape_jhmi_cancer(
-            context, source_url, profile_sem, errors
-        )
+        print('   [ADAPTER] Johns Hopkins Radiation Oncology', flush=True)
+        records = await scrape_jhmi_cancer(context, source_url, profile_sem, errors)
 
-    elif _is_uh_cancer(source_url) and "clinical-faculty" in source_url.casefold():
-        print("   [ADAPTER] UH Cancer Center clinical faculty", flush=True)
-        records = await scrape_uh_cancer(
-            context, source_url, profile_sem, errors
-        )
+    elif _is_uh_cancer(source_url) and 'clinical-faculty' in source_url.casefold():
+        print('   [ADAPTER] UH Cancer Center clinical faculty', flush=True)
+        records = await scrape_uh_cancer(context, source_url, profile_sem, errors)
 
     elif _is_mayo_cancer(source_url):
-        print("   [ADAPTER] Mayo Cancer Center faculty", flush=True)
-        records = await scrape_mayo_cancer(
-            context, source_url, profile_sem, errors
-        )
+        print('   [ADAPTER] Mayo Cancer Center faculty', flush=True)
+        records = await scrape_mayo_cancer(context, source_url, profile_sem, errors)
 
     elif _v11_is_uiowa_directory(source_url):
-        print("   [ADAPTER] University of Iowa Psychiatry directory", flush=True)
-        records = await scrape_uiowa_directory_v11(
-            context, source_url, profile_sem, errors
-        )
+        print('   [ADAPTER] University of Iowa Psychiatry directory', flush=True)
+        records = await scrape_uiowa_directory_v11(context, source_url, profile_sem, errors)
 
     elif _v11_is_uiowa_research_team(source_url):
-        print("   [ADAPTER] University of Iowa Psychiatry research team", flush=True)
-        records = await scrape_uiowa_research_team_v11(
-            context, source_url, profile_sem, errors
-        )
+        print('   [ADAPTER] University of Iowa Psychiatry research team', flush=True)
+        records = await scrape_uiowa_research_team_v11(context, source_url, profile_sem, errors)
 
     elif _v11_is_upenn_faculty_database(source_url):
-        print("   [ADAPTER] UPenn Psychiatry faculty database", flush=True)
-        records = await scrape_upenn_faculty_v11(
-            context, source_url, profile_sem, errors
-        )
+        print('   [ADAPTER] UPenn Psychiatry faculty database', flush=True)
+        records = await scrape_upenn_faculty_v11(context, source_url, profile_sem, errors)
 
     else:
-        print("   [ADAPTER] Universal email-first + profile-first parser", flush=True)
+        print('   [ADAPTER] Universal email-first + profile-first parser', flush=True)
         records = await scrape_generic_v12(
-            context,
-            source_url,
-            llm_enabled,
-            llm_sem,
-            profile_sem,
-            errors,
+            context, source_url, llm_enabled, llm_sem, profile_sem, errors
         )
 
     final: List[PersonRecord] = []
-    for rec in dedupe_records_v13(records):
+    for rec in dedupe_records_v14(records):
         rec.source_url = source_url
-        ok, reason = validate_record_v13(rec)
+        ok, reason = _v14_finalize_record(rec)
         if ok:
             final.append(rec)
         else:
             errors.append({
-                "type": "rejected_record",
-                "reason": reason,
-                "name": excel_safe(rec.name),
-                "email": excel_safe(rec.email),
-                "country": excel_safe(rec.country),
-                "profile_url": excel_safe(rec.profile_url),
-                "source_url": source_url,
-                "method": excel_safe(rec.extraction_method),
+                'type': 'rejected_record', 'reason': reason,
+                'name': excel_safe(rec.name), 'email': excel_safe(rec.email),
+                'country': excel_safe(rec.country), 'profile_url': excel_safe(rec.profile_url),
+                'source_url': source_url, 'method': excel_safe(rec.extraction_method),
             })
 
-    final = dedupe_records_v13(final)
-
+    final = dedupe_records_v14(final)
     print(
-        f"   [QUALITY] accepted={len(final)} "
-        f"unique_emails={len({x.email for x in final if x.email})} "
-        f"blank_names={sum(1 for x in final if not x.name)}",
+        f'   [QUALITY] accepted={len(final)} '
+        f'unique_emails={len({r.email for r in final if r.email})} '
+        f'blank_names={sum(1 for r in final if not r.name)}',
         flush=True,
     )
 
-    for rec in final:
-        print(
-            f"      {(rec.name or '[email-only]')[:40]:40} | "
-            f"{rec.email[:38]:38} | "
-            f"{(rec.profile_url or '')[:55]}",
-            flush=True,
-        )
-
     if not final:
         errors.append({
-            "type": "no_verified_emails",
-            "source_url": source_url,
-            "message": "No syntactically valid emails found after HTTP + browser + profile checks.",
+            'type': 'no_verified_emails',
+            'source_url': source_url,
+            'message': 'No syntactically valid emails found after robust HTTP/request/browser/profile checks.',
         })
 
     return final
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
