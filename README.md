@@ -1,1 +1,2 @@
-# scitech_scrapper_agent
+python university_staff_scraper.py
+python clean_university_data.py

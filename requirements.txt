@@ -1,0 +1,11 @@
+qrcode[pil]
+pandas
+playwright
+beautifulsoup4
+openpyxl
+requests
+pycountry
+email-validator
+lxml
+pypdf
+pymupdf
