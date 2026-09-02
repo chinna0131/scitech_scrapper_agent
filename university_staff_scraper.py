@@ -7148,25 +7148,69 @@ def _v14_finalize_record(rec: PersonRecord) -> Tuple[bool, str]:
 
 def dedupe_records_v14(records: List[PersonRecord]) -> List[PersonRecord]:
     """
-    Deduplication strategy:
-      * explicit person/profile associations => profile+email or name+email
-      * shared service email may remain for several people
-      * normal generic records => email key
-      * profile placeholders => profile key
+    Final dedupe rules.
+
+    EyeDoctors.ie:
+      * one row per doctor profile
+      * prefer a personal email as primary
+      * retain every other valid email in alternate_emails
+
+    USZ:
+      * one row per explicit person/profile + mailbox association
+      * shared clinic/service mailboxes may legitimately repeat for many people
+
+    Generic sources:
+      * dedupe by primary email where no stronger person/profile identity exists
     """
     merged: Dict[Tuple, PersonRecord] = {}
+
+    def _alts(rec: PersonRecord) -> List[str]:
+        vals = []
+        for raw in re.split(r'[|;]+', str(rec.alternate_emails or '')):
+            e = normalize_email(raw.strip())
+            if e:
+                vals.append(e)
+        return unique(vals)
+
+    def _prefer_email(a: str, b: str, name: str = '') -> Tuple[str, str]:
+        """Return (preferred_primary, other_email)."""
+        a = normalize_email(a)
+        b = normalize_email(b)
+        if not a:
+            return b, ''
+        if not b:
+            return a, ''
+
+        def score(e: str) -> int:
+            value = 0
+            if not _v14_is_shared_email(e):
+                value += 100
+            value += min(60, email_name_score(name, e))
+            return value
+
+        if score(b) > score(a):
+            return b, a
+        return a, b
 
     for rec in records:
         rec.email = normalize_email(rec.email)
         purl = normalize_url(rec.profile_url).casefold()
         nkey = normalize_name_key(rec.name) or clean_text(rec.name).casefold()
+        method = (rec.extraction_method or '').casefold()
         trusted = _v14_is_trusted(rec)
         shared = _v14_is_shared_email(rec.email) if rec.email else False
 
-        if rec.email and purl and trusted:
-            key = ('profile_email', purl, rec.email)
-        elif rec.email and nkey and (trusted or shared):
-            key = ('name_email', nkey, rec.email)
+        # EyeDoctors profiles represent one doctor. Do not emit one row per
+        # practice email; merge all verified profile emails into one record.
+        if purl and 'eyedoctors_profile_v14' in method:
+            key = ('eyedoctors_profile', purl)
+        # USZ explicitly binds the person card to a displayed clinic mailbox.
+        elif rec.email and purl and ('usz_card_v14' in method or 'usz_profile_v14' in method):
+            key = ('usz_profile_email', purl, rec.email)
+        elif rec.email and nkey and trusted:
+            key = ('trusted_name_email', nkey, rec.email)
+        elif rec.email and nkey and shared:
+            key = ('shared_name_email', nkey, rec.email)
         elif rec.email:
             key = ('email', rec.email)
         elif purl:
@@ -7175,11 +7219,28 @@ def dedupe_records_v14(records: List[PersonRecord]) -> List[PersonRecord]:
             key = ('name_source', nkey, normalize_url(rec.source_url).casefold())
 
         if key not in merged:
+            rec.alternate_emails = ' | '.join(
+                e for e in _alts(rec) if e != rec.email
+            )
             merged[key] = rec
             continue
 
         cur = merged[key]
-        # Prefer stronger human name / profile data.
+
+        # If two EyeDoctors observations have different primary emails, retain
+        # both, preferring the personal/name-matching address as primary.
+        if key[0] == 'eyedoctors_profile':
+            preferred, other = _prefer_email(cur.email, rec.email, cur.name or rec.name)
+            accumulated = _alts(cur) + _alts(rec)
+            if other:
+                accumulated.append(other)
+            cur.email = preferred
+            cur.email_type = 'shared/role' if _v14_is_shared_email(preferred) else 'personal'
+            cur.alternate_emails = ' | '.join(unique([
+                e for e in accumulated
+                if normalize_email(e) and normalize_email(e) != preferred
+            ]))
+
         if (not _v14_clean_name(cur.name)) and _v14_clean_name(rec.name):
             cur.name = rec.name
         if not cur.profile_url and rec.profile_url:
@@ -7191,17 +7252,17 @@ def dedupe_records_v14(records: List[PersonRecord]) -> List[PersonRecord]:
         for field_name in COLUMNS:
             if not hasattr(cur, field_name) or not hasattr(rec, field_name):
                 continue
+            if field_name in {'email', 'email_type', 'alternate_emails'} and key[0] == 'eyedoctors_profile':
+                continue
             old = getattr(cur, field_name)
             new = getattr(rec, field_name)
             if field_name == 'confidence':
                 cur.confidence = max(int(cur.confidence or 0), int(rec.confidence or 0))
             elif field_name == 'alternate_emails':
-                vals = []
-                for part in (old, new):
-                    vals.extend([x.strip() for x in re.split(r'[|;]+', str(part or '')) if x.strip()])
+                vals = _alts(cur) + _alts(rec)
                 cur.alternate_emails = ' | '.join(unique([
-                    normalize_email(x) for x in vals
-                    if normalize_email(x) and normalize_email(x) != normalize_email(cur.email)
+                    e for e in vals
+                    if normalize_email(e) and normalize_email(e) != normalize_email(cur.email)
                 ]))
             elif not old and new:
                 setattr(cur, field_name, new)
@@ -7573,74 +7634,149 @@ def _v14_dt_dd_pairs(root: Tag) -> List[Tuple[str, Tag]]:
     return out
 
 
-def parse_eyedoctors_profile_v14(html: str, profile_url: str, source_url: str, name_hint: str = '') -> List[PersonRecord]:
+def parse_eyedoctors_profile_v14(
+    html: str,
+    profile_url: str,
+    source_url: str,
+    name_hint: str = '',
+) -> List[PersonRecord]:
+    """
+    Parse exactly ONE EyeDoctors.ie doctor profile into at most ONE row.
+
+    Critical rules:
+      * never scrape footer/global site emails
+      * only inspect dl.member-details and its practice/private-room blocks
+      * collect every valid profile email
+      * prefer personal/name-matching email as primary
+      * move all remaining verified emails to alternate_emails
+      * if only a shared practice mailbox exists, keep it (email is mandatory)
+        because it is explicitly present on that doctor's profile
+    """
     soup = BeautifulSoup(html, 'html.parser')
-    # IMPORTANT: restrict to member-details. This prevents footer info@eyedoctors.ie
-    # from being attached to every doctor.
-    details = soup.select_one('#details dl.member-details') or soup.select_one('dl.member-details')
+
+    details = (
+        soup.select_one('#details dl.member-details')
+        or soup.select_one('dl.member-details')
+    )
     if details is None:
         return []
 
     root = soup.select_one('#details') or details.parent or details
     h1 = root.select_one('h1')
-    name = _v14_clean_name(h1.get_text(' ', strip=True) if h1 else name_hint)
+    name = _v14_clean_name(
+        h1.get_text(' ', strip=True) if h1 else name_hint
+    )
     if not name:
         name = _v14_clean_name(name_hint)
 
-    specialty = []
+    specialty: List[str] = []
     contact_nodes: List[Tag] = []
+
     for label, dd in _v14_dt_dd_pairs(details):
         low = label.casefold()
         text = clean_text(dd.get_text(' ', strip=True))
-        if 'sub-specialty' in low or 'sub specialty' in low or 'specialty' in low:
+
+        if (
+            'sub-specialty' in low
+            or 'sub specialty' in low
+            or 'specialty' in low
+        ):
             if text:
                 specialty.append(text)
-        if 'private rooms' in low or 'practice' in low or 'clinic' in low:
+
+        # Only these local blocks are allowed to provide a doctor contact.
+        if any(x in low for x in (
+            'private rooms', 'private room', 'practice', 'clinic',
+            'contact details', 'contact detail',
+        )):
             contact_nodes.append(dd)
 
-    # Email MUST come from member-details, preferably private-room/practice DD.
+    # Some profiles place Email/Tel as their own dt/dd pair rather than inside
+    # Private Rooms. Include those DDs, still strictly inside member-details.
+    for label, dd in _v14_dt_dd_pairs(details):
+        low = label.casefold().strip(' :')
+        if low in {'email', 'e-mail', 'contact', 'telephone', 'tel'}:
+            if dd not in contact_nodes:
+                contact_nodes.append(dd)
+
     nodes = contact_nodes or [details]
+
+    # email -> strongest local node
     email_map: Dict[str, Tag] = {}
     for node in nodes:
         for a in node.select('a[href^="mailto:"], a[href^="MAILTO:"]'):
-            e = normalize_email(a.get('href', '')) or normalize_email(a.get_text(' ', strip=True))
+            e = (
+                normalize_email(a.get('href', ''))
+                or normalize_email(a.get_text(' ', strip=True))
+            )
             if e:
-                email_map[e] = node
+                email_map.setdefault(e, node)
 
-    # Plain visible email fallback, still constrained to member-details nodes.
-    if not email_map:
-        for node in nodes:
-            for e in extract_text_emails(clean_text(node.get_text(' ', strip=True))):
-                email_map[e] = node
-
-    records = []
-    for email, node in email_map.items():
+    # Plain-text fallback is allowed only inside the same member-details blocks.
+    for node in nodes:
         text = clean_text(node.get_text(' ', strip=True))
-        phone = extract_phone(node)
-        # Remove labels but preserve practice name/address.
-        affiliation = re.sub(r'(?i)\bEmail\s*:\s*\S+', ' ', text)
-        affiliation = re.sub(r'(?i)\bTel\s*:\s*[^W]+(?=Web:|Email:|$)', ' ', affiliation)
-        affiliation = clean_text(affiliation)[:700]
+        if len(text) > 1200:
+            continue
+        for e in extract_text_emails(text):
+            email_map.setdefault(e, node)
 
-        records.append(PersonRecord(
-            name=name,
-            email=email,
-            country='Ireland',
-            country_source='site_adapter',
-            email_type='shared/role' if _v14_is_shared_email(email) else 'personal',
-            email_conflict='no',
-            page_type='UNIVERSITY_DIRECTORY',
-            specialty='; '.join(unique(specialty)),
-            affiliation=affiliation,
-            phone=phone,
-            profile_url=profile_url,
-            source_url=source_url,
-            confidence=100 if name else 93,
-            extraction_method='eyedoctors_profile_v14',
-            scrape_status='accepted',
-        ))
+    if not email_map:
+        return []
 
-    return dedupe_records_v14(records)
+    emails = list(email_map.keys())
+
+    def email_rank(email: str) -> Tuple[int, int, str]:
+        # Personal/name-correlated addresses outrank shared clinic mailboxes.
+        personal_bonus = 100 if not _v14_is_shared_email(email) else 0
+        match = email_name_score(name, email) if name else 0
+        # deterministic tie-breaker keeps output stable
+        return (personal_bonus + match, match, email)
+
+    emails.sort(key=email_rank, reverse=True)
+    primary = emails[0]
+    alternates = emails[1:]
+    primary_node = email_map[primary]
+
+    # Build bounded practice/contact metadata from all local contact blocks,
+    # not from the full page.
+    affiliation_parts: List[str] = []
+    phone = ''
+    for node in nodes:
+        text = clean_text(node.get_text(' ', strip=True))
+        if not text:
+            continue
+        # Remove email strings/labels but retain practice/address text.
+        for e in emails:
+            text = re.sub(re.escape(e), ' ', text, flags=re.I)
+        text = re.sub(r'(?i)\bE-?mail\s*:\s*', ' ', text)
+        text = clean_text(text)
+        if text:
+            affiliation_parts.append(text)
+        if not phone:
+            phone = extract_phone(node)
+
+    affiliation = ' | '.join(unique(affiliation_parts))[:700]
+
+    rec = PersonRecord(
+        name=name,
+        email=primary,
+        alternate_emails=' | '.join(alternates),
+        country='Ireland',
+        country_source='site_adapter',
+        email_type='shared/role' if _v14_is_shared_email(primary) else 'personal',
+        email_conflict='no',
+        page_type='UNIVERSITY_DIRECTORY',
+        specialty='; '.join(unique(specialty)),
+        affiliation=affiliation,
+        phone=phone or extract_phone(primary_node),
+        profile_url=profile_url,
+        source_url=source_url,
+        confidence=100 if name and not _v14_is_shared_email(primary) else (96 if name else 90),
+        extraction_method='eyedoctors_profile_v14',
+        scrape_status='accepted',
+    )
+
+    return [rec]
 
 
 async def scrape_eyedoctors_v14(context, source_url: str, profile_sem: asyncio.Semaphore, errors: List[Dict]) -> List[PersonRecord]:
