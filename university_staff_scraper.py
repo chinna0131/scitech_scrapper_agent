@@ -41,9 +41,9 @@ HEADLESS = True
 HTTP_TIMEOUT = 25
 PLAYWRIGHT_TIMEOUT = 25_000
 PROFILE_TIMEOUT = 25_000
-PROFILE_CONCURRENCY = 4
+PROFILE_CONCURRENCY = 2
 FOLLOW_PAGINATION = True
-MAX_PAGES_PER_URL = 50
+MAX_PAGES_PER_URL = 20
 MAX_SCROLL_ROUNDS = 10
 MAX_LOAD_MORE_CLICKS = 15
 MIN_DELAY = 0.25
@@ -7841,6 +7841,766 @@ async def scrape_eyedoctors_v14(context, source_url: str, profile_sem: asyncio.S
     return records
 
 
+
+# =============================================================================
+# V16 GENERIC SEMANTIC UNIVERSITY CRAWLER
+# =============================================================================
+# Goals:
+#   * profile links can have ANY URL format; URL path patterns are only hints
+#   * identify profile links from human-name anchors + local person structure
+#   * verify identity on fetched profile pages
+#   * extract emails only from profile-local evidence
+#   * support URL pagination, numeric pagination, next buttons, load-more,
+#     AJAX pagination and infinite scroll
+#   * stop on content stability, not on one specific pagination pattern
+# =============================================================================
+
+V16_MAX_LISTING_STATES = 120
+V16_MAX_PROFILES = 2500
+V16_STABLE_ROUNDS = 2
+V16_BROWSER_INTERACTIONS = 80
+V16_PROFILE_FETCH_RETRIES = 2
+
+V16_BAD_HOST_PARTS = (
+    'linkedin.com', 'facebook.com', 'instagram.com', 'twitter.com', 'x.com',
+    'youtube.com', 'researchgate.net', 'orcid.org', 'scholar.google',
+    'scopus.com', 'doi.org', 'pubmed.ncbi.nlm.nih.gov',
+)
+V16_BAD_EXT = (
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.rar',
+    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.mp4', '.mp3', '.ics',
+)
+V16_BAD_LINK_TEXT = {
+    'home', 'about', 'contact', 'contacts', 'news', 'events', 'event', 'research',
+    'publications', 'publication', 'projects', 'project', 'read more', 'learn more',
+    'more', 'details', 'website', 'homepage', 'email', 'e-mail', 'phone',
+    'privacy', 'cookies', 'cookie policy', 'next', 'previous', 'back', 'login',
+    'download', 'downloads', 'apply', 'search', 'menu',
+}
+V16_PERSON_CUES = (
+    'professor', 'researcher', 'scientist', 'lecturer', 'faculty', 'staff',
+    'postdoc', 'postdoctoral', 'doctoral', 'phd', 'research fellow',
+    'senior scientist', 'assistant professor', 'associate professor',
+    'technician', 'engineer', 'group leader', 'principal investigator',
+)
+V16_PAGINATION_TEXT = {
+    'next', 'next page', 'older', 'more', 'load more', 'show more', 'view more',
+    '>', '›', '»', '→',
+}
+
+
+def _v16_host(url: str) -> str:
+    try:
+        return urlparse(normalize_url(url)).netloc.casefold().replace('www.', '').split(':')[0]
+    except Exception:
+        return ''
+
+
+def _v16_root_domain(url: str) -> str:
+    host = _v16_host(url)
+    if not host:
+        return ''
+    # Preserve common academic/public suffixes.
+    parts = host.split('.')
+    if len(parts) <= 2:
+        return host
+    multi = {'ac.uk', 'co.uk', 'edu.au', 'ac.jp', 'ac.kr', 'edu.cn'}
+    suffix2 = '.'.join(parts[-2:])
+    if suffix2 in multi and len(parts) >= 3:
+        return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
+
+
+def _v16_same_org(a: str, b: str) -> bool:
+    ra, rb = _v16_root_domain(a), _v16_root_domain(b)
+    return bool(ra and rb and ra == rb)
+
+
+def _v16_bad_target(url: str) -> bool:
+    if not url:
+        return True
+    p = urlparse(url)
+    host = p.netloc.casefold().replace('www.', '')
+    path = (p.path or '').casefold()
+    if any(x in host for x in V16_BAD_HOST_PARTS):
+        return True
+    if path.endswith(V16_BAD_EXT):
+        return True
+    if p.scheme not in {'http', 'https'}:
+        return True
+    return False
+
+
+def _v16_name_from_anchor(a: Tag) -> str:
+    vals = [
+        clean_text(a.get_text(' ', strip=True)),
+        clean_text(a.get('aria-label', '')),
+        clean_text(a.get('title', '')),
+    ]
+    img = a.select_one('img[alt]')
+    if img:
+        vals.append(clean_text(img.get('alt', '')))
+    for value in vals:
+        if not value:
+            continue
+        # Remove common prefixes while keeping the original spelling.
+        value = re.sub(r'(?i)^\s*(?:prof(?:essor)?|dr|mr|mrs|ms|miss)\.?\s+', '', value)
+        n = clean_person_name_candidate(value)
+        if n and plausible_name(n) and n.casefold() not in V16_BAD_LINK_TEXT:
+            return n
+    return ''
+
+
+def _v16_person_container(anchor: Tag) -> Optional[Tag]:
+    """Return a compact local block likely representing one person."""
+    best = None
+    best_score = -999
+    cur = anchor
+    for depth in range(7):
+        if not isinstance(cur, Tag):
+            break
+        parent = cur if depth == 0 else cur.parent
+        if not isinstance(parent, Tag) or parent.name in {'body', 'html'}:
+            break
+        txt = clean_text(parent.get_text(' ', strip=True))
+        if len(txt) > 2600:
+            cur = parent
+            continue
+        score = 0
+        cls = ' '.join(parent.get('class', [])).casefold()
+        if parent.name in {'article', 'li', 'tr'}:
+            score += 25
+        if any(k in cls for k in ('person', 'people', 'staff', 'faculty', 'member', 'team', 'profile', 'card', 'researcher')):
+            score += 35
+        low = txt.casefold()
+        if any(cue in low for cue in V16_PERSON_CUES):
+            score += 20
+        # prefer blocks with only a few links, typical for person cards
+        links = parent.select('a[href]')
+        if 1 <= len(links) <= 8:
+            score += 15
+        score -= depth * 3
+        if score > best_score:
+            best_score, best = score, parent
+        cur = parent
+    return best or (anchor.parent if isinstance(anchor.parent, Tag) else anchor)
+
+
+def _v16_score_person_link(anchor: Tag, source_url: str) -> Tuple[int, str, str]:
+    href = clean_text(anchor.get('href', ''))
+    if not href or href.casefold().startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+        return 0, '', ''
+    url = normalize_url(urljoin(source_url, href))
+    if not url.startswith(('http://', 'https://')) or _v16_bad_target(url):
+        return 0, '', ''
+    if normalize_url(url).rstrip('/') == normalize_url(source_url).rstrip('/'):
+        return 0, '', ''
+
+    name = _v16_name_from_anchor(anchor)
+    if not name:
+        return 0, '', ''
+
+    score = 60  # human name on link is the main signal
+    tokens = _name_tokens(name)
+    if len(tokens) >= 2:
+        score += 25
+
+    block = _v16_person_container(anchor)
+    if block is not None:
+        btxt = clean_text(block.get_text(' ', strip=True)).casefold()
+        if any(cue in btxt for cue in V16_PERSON_CUES):
+            score += 25
+        cls = ' '.join(block.get('class', [])).casefold()
+        if any(k in cls for k in ('person', 'people', 'staff', 'faculty', 'member', 'team', 'profile', 'card', 'researcher')):
+            score += 25
+
+    # Same institution is a strong hint, but NOT a requirement.
+    if _v16_same_org(source_url, url):
+        score += 35
+    else:
+        # external links are allowed only when very strongly person-associated
+        score -= 15
+
+    # Conventional profile-like URL is only a hint, never a requirement.
+    path = (urlparse(url).path or '').casefold()
+    if any(x in path for x in ('profile', 'people', 'person', 'staff', 'faculty', 'team', 'member', 'researcher', 'sitoweb')):
+        score += 10
+
+    return score, url, name
+
+
+def discover_person_profiles_v16(html: str, source_url: str) -> List[PersonRecord]:
+    soup = BeautifulSoup(html or '', 'html.parser')
+    out: List[PersonRecord] = []
+    seen = set()
+
+    # Evaluate every link. We are structural/semantic, not path-based.
+    for a in soup.select('a[href]'):
+        score, url, name = _v16_score_person_link(a, source_url)
+        if score < 95 or not url or not name:
+            continue
+        key = url.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        block = _v16_person_container(a)
+        title = ''
+        affiliation = ''
+        if block is not None:
+            text = clean_text(block.get_text(' ', strip=True))
+            for sel in ('.title', '.role', '.position', '.job-title', '.academic-title', 'h3', 'h4', 'p'):
+                el = block.select_one(sel)
+                if el:
+                    t = clean_text(el.get_text(' ', strip=True))
+                    if t and t != name and len(t) <= 220 and not plausible_name(t):
+                        title = t
+                        break
+            affiliation = text.replace(name, '', 1).strip(' ,;:-')[:700]
+
+        out.append(PersonRecord(
+            name=name,
+            page_type='UNIVERSITY_DIRECTORY',
+            academic_title=title,
+            affiliation=affiliation,
+            profile_url=url,
+            source_url=source_url,
+            confidence=min(95, score),
+            extraction_method='semantic_profile_discovery_v16',
+        ))
+        if len(out) >= V16_MAX_PROFILES:
+            break
+    return out
+
+
+def _v16_page_signature(html: str, url: str) -> Tuple[str, Tuple[str, ...], Tuple[str, ...]]:
+    """Stable signature based on people/profile links and emails, not raw HTML."""
+    profiles = discover_person_profiles_v16(html, url)
+    pset = tuple(sorted({normalize_url(r.profile_url).casefold() for r in profiles if r.profile_url}))
+    emails = tuple(sorted(set(extract_text_emails(clean_text(BeautifulSoup(html or '', 'html.parser').get_text(' ', strip=True))))))
+    return normalize_url(url).casefold(), pset, emails
+
+
+def _v16_url_pagination_candidates(html: str, current_url: str, source_url: str) -> List[str]:
+    soup = BeautifulSoup(html or '', 'html.parser')
+    scored = []
+    for a in soup.select('a[href]'):
+        href = clean_text(a.get('href', ''))
+        if not href or href.casefold().startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+            continue
+        url = normalize_url(urljoin(current_url, href))
+        if not url.startswith(('http://', 'https://')):
+            continue
+        if not _v16_same_org(url, source_url):
+            continue
+        if normalize_url(url).casefold() == normalize_url(current_url).casefold():
+            continue
+
+        text = clean_text(a.get_text(' ', strip=True)).casefold()
+        rel = [str(x).casefold() for x in (a.get('rel') or [])]
+        p = urlparse(url)
+        qs = parse_qs(p.query)
+        score = 0
+        if 'next' in rel:
+            score += 120
+        if text in V16_PAGINATION_TEXT:
+            score += 100
+        if re.fullmatch(r'\d{1,4}', text):
+            score += 45
+        if any(k.casefold() in {'page', 'p', 'pg', 'offset', 'start', 'from', 'cursor'} for k in qs):
+            score += 35
+        if re.search(r'/(?:page|p)/?\d+/?$', p.path, re.I):
+            score += 35
+        aria = clean_text(a.get('aria-label', '')).casefold()
+        if 'next' in aria or 'page' in aria:
+            score += 45
+        cls = ' '.join(a.get('class', [])).casefold()
+        if 'pagination' in cls or 'pager' in cls or 'next' in cls:
+            score += 30
+        if score >= 40:
+            scored.append((score, url))
+
+    seen = set()
+    out = []
+    for _, u in sorted(scored, key=lambda x: x[0], reverse=True):
+        k = u.casefold()
+        if k not in seen:
+            seen.add(k)
+            out.append(u)
+    return out
+
+
+async def _v16_browser_collect_listing_states(context, start_url: str, errors: List[Dict]) -> List[Tuple[str, str]]:
+    """Collect rendered listing states via next/numeric/load-more/infinite-scroll."""
+    states: List[Tuple[str, str]] = []
+    page = await context.new_page()
+    seen_signatures = set()
+    stable = 0
+    interactions = 0
+    current_numeric = 1
+    try:
+        try:
+            await page.goto(start_url, wait_until='domcontentloaded', timeout=PLAYWRIGHT_TIMEOUT)
+        except Exception:
+            try:
+                await page.goto(start_url, wait_until='commit', timeout=PLAYWRIGHT_TIMEOUT)
+            except Exception as exc:
+                errors.append({'type': 'browser_listing_fetch_failed', 'source_url': start_url, 'error': excel_safe(str(exc))})
+                return states
+
+        await dismiss_popups(page)
+        await page.wait_for_timeout(700)
+
+        while interactions < V16_BROWSER_INTERACTIONS and len(states) < V16_MAX_LISTING_STATES:
+            try:
+                await auto_scroll(page)
+            except Exception:
+                pass
+            await page.wait_for_timeout(350)
+            html = await page.content()
+            sig = _v16_page_signature(html, page.url)
+            if sig not in seen_signatures:
+                seen_signatures.add(sig)
+                states.append((page.url, html))
+                stable = 0
+            else:
+                stable += 1
+
+            # 1) load more/show more/view more
+            clicked = False
+            for label in ('Load more', 'Load More', 'Show more', 'Show More', 'View more', 'View More', 'More results'):
+                try:
+                    loc = page.get_by_text(label, exact=True).first
+                    if await loc.count() and await loc.is_visible():
+                        disabled = await loc.get_attribute('disabled')
+                        aria_disabled = await loc.get_attribute('aria-disabled')
+                        if disabled is None and aria_disabled != 'true':
+                            await loc.click(timeout=2200)
+                            await page.wait_for_timeout(700)
+                            clicked = True
+                            interactions += 1
+                            break
+                except Exception:
+                    pass
+            if clicked:
+                continue
+
+            # 2) explicit next controls
+            selectors = [
+                "a[rel='next']", "button[rel='next']", ".pagination-next a", ".pager-next a",
+                ".pagination .next a", "a[aria-label*='Next']", "button[aria-label*='Next']",
+                "a[title*='Next']", "button[title*='Next']",
+            ]
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() and await loc.is_visible():
+                        disabled = await loc.get_attribute('disabled')
+                        aria_disabled = await loc.get_attribute('aria-disabled')
+                        if disabled is None and aria_disabled != 'true':
+                            await loc.click(timeout=2200)
+                            await page.wait_for_timeout(700)
+                            clicked = True
+                            interactions += 1
+                            break
+                except Exception:
+                    pass
+            if clicked:
+                current_numeric += 1
+                continue
+
+            # 3) text-based next
+            for label in ('Next', 'NEXT', 'next', 'Next page', '›', '»', '>'):
+                try:
+                    loc = page.get_by_text(label, exact=True).last
+                    if await loc.count() and await loc.is_visible():
+                        await loc.click(timeout=2200)
+                        await page.wait_for_timeout(700)
+                        clicked = True
+                        interactions += 1
+                        break
+                except Exception:
+                    pass
+            if clicked:
+                current_numeric += 1
+                continue
+
+            # 4) numeric next page
+            target = str(current_numeric + 1)
+            for role in ('link', 'button'):
+                try:
+                    loc = page.get_by_role(role, name=target, exact=True).last
+                    if await loc.count() and await loc.is_visible():
+                        disabled = await loc.get_attribute('disabled')
+                        aria_disabled = await loc.get_attribute('aria-disabled')
+                        if disabled is None and aria_disabled != 'true':
+                            await loc.click(timeout=2200)
+                            await page.wait_for_timeout(700)
+                            clicked = True
+                            interactions += 1
+                            current_numeric += 1
+                            break
+                except Exception:
+                    pass
+            if clicked:
+                continue
+
+            # 5) infinite scroll: one extra content-growth attempt
+            try:
+                before = await page.evaluate('document.body.scrollHeight')
+                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                await page.wait_for_timeout(900)
+                after = await page.evaluate('document.body.scrollHeight')
+                interactions += 1
+                if after > before:
+                    continue
+            except Exception:
+                pass
+
+            if stable >= V16_STABLE_ROUNDS:
+                break
+            # no control and no growth => stable termination
+            stable += 1
+            if stable >= V16_STABLE_ROUNDS:
+                break
+
+    finally:
+        await page.close()
+    return states
+
+
+def _v16_profile_name_match(expected: str, html: str) -> bool:
+    if not expected:
+        return True
+    soup = BeautifulSoup(html or '', 'html.parser')
+    expected_tokens = set(_name_tokens(expected))
+    if not expected_tokens:
+        return True
+    candidates = []
+    for sel in ("[itemprop='name']", 'main h1', 'article h1', '.person-name', '.profile-name', '.staff-name', '.faculty-name', 'h1'):
+        for el in soup.select(sel):
+            n = clean_person_name_candidate(el.get_text(' ', strip=True))
+            if n and plausible_name(n):
+                candidates.append(n)
+    if not candidates:
+        return True  # don't reject profiles solely because markup lacks heading
+    for n in candidates:
+        actual = set(_name_tokens(n))
+        if actual and expected_tokens & actual:
+            return True
+    return False
+
+
+def _v16_extract_profile(html: str, profile_url: str, source_url: str, name_hint: str) -> Optional[PersonRecord]:
+    if not html:
+        return None
+    if not _v16_profile_name_match(name_hint, html):
+        return None
+
+    soup = BeautifulSoup(html, 'html.parser')
+    root = soup.select_one('main') or soup.select_one('article') or soup.select_one('#main-content') or soup.select_one('#content') or soup.body or soup
+
+    # Name: listing hint first, otherwise profile heading/JSON-LD.
+    name = clean_person_name_candidate(name_hint) if name_hint else ''
+    if not (name and plausible_name(name)):
+        try:
+            name = _v11_extract_profile_name(soup, '')
+        except Exception:
+            name = ''
+    if not name:
+        for sel in ("[itemprop='name']", 'main h1', 'article h1', '.person-name', '.profile-name', '.staff-name', '.faculty-name', 'h1'):
+            el = soup.select_one(sel)
+            if el:
+                n = clean_person_name_candidate(el.get_text(' ', strip=True))
+                if n and plausible_name(n):
+                    name = n
+                    break
+
+    # Comprehensive profile-local email evidence.
+    try:
+        evidence = _v11_extract_email_evidence(root)
+    except Exception:
+        evidence = []
+
+    # Fallback direct mailto/plain contact blocks.
+    if not evidence:
+        for a in root.select('a[href]'):
+            href = clean_text(a.get('href', ''))
+            if href.casefold().startswith('mailto:'):
+                e = normalize_email(href.split('?', 1)[0]) or normalize_email(a.get_text(' ', strip=True))
+                if e:
+                    evidence.append((190, e, a, 'mailto_v16'))
+        for el in root.select("p,li,dd,dt,address,[class*='email'],[class*='contact'],[id*='email'],[id*='contact']"):
+            txt = clean_text(el.get_text(' ', strip=True))
+            if txt and len(txt) <= 700:
+                for e in extract_text_emails(txt):
+                    evidence.append((110, e, el, 'local_text_v16'))
+
+    ranked = []
+    seen_emails = set()
+    for base, raw_email, node, kind in evidence:
+        email = normalize_email(raw_email)
+        if not email or email in seen_emails:
+            continue
+        seen_emails.add(email)
+        score = int(base)
+        if name:
+            score += min(50, email_name_score(name, email))
+        local = ''
+        if node is not None:
+            try:
+                local = clean_text(_nearest_person_container(node, email, max_chars=1200).get_text(' ', strip=True)).casefold()
+            except Exception:
+                try:
+                    local = clean_text(node.get_text(' ', strip=True)).casefold()
+                except Exception:
+                    local = ''
+        if name and local:
+            if any(t in local for t in _name_tokens(name)):
+                score += 25
+        if any(x in local for x in ('webmaster', 'press office', 'media contact', 'general enquiries', 'general inquiries', 'privacy')):
+            score -= 140
+        # Shared/generic allowed only when it is genuinely profile-local; personal preferred.
+        if is_generic_email(email) or is_strict_generic_email(email):
+            if base < 150:
+                score -= 100
+            else:
+                score -= 25
+        ranked.append((score, email, node, kind))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if not ranked or ranked[0][0] < 90:
+        return None
+
+    best_score, email, email_node, email_kind = ranked[0]
+    alternates = []
+    for score, e, _, _ in ranked[1:]:
+        if e != email and score >= 110 and e not in alternates:
+            alternates.append(e)
+
+    # Metadata from a compact profile-local block where possible.
+    local_block = root
+    if email_node is not None:
+        try:
+            local_block = _nearest_person_container(email_node, email, max_chars=1500)
+        except Exception:
+            pass
+    local_text = clean_text(local_block.get_text(' ', strip=True))
+    links = extract_links(root, profile_url)
+    affiliation = split_affiliation_from_block(local_block, name, [email] + alternates, '')[:700]
+
+    title = ''
+    for sel in ('.job-title', '.person-title', '.profile-title', '.role', '.position', '.academic-title', '[class*="title"]'):
+        el = root.select_one(sel)
+        if el:
+            t = clean_text(el.get_text(' ', strip=True))
+            if t and t != name and len(t) <= 220:
+                title = t
+                break
+
+    country = country_from_tld(email)
+    country_source = 'email_tld' if country else ''
+    if not country:
+        c = extract_country_from_text(affiliation)
+        if c:
+            country, country_source = c, 'affiliation'
+
+    return PersonRecord(
+        name=name if name and plausible_name(name) else name_from_email(email),
+        email=email,
+        country=country,
+        alternate_emails=' | '.join(unique(alternates)),
+        email_type='shared/role' if (is_generic_email(email) or is_strict_generic_email(email)) else 'personal',
+        email_conflict='no',
+        page_type='UNIVERSITY_DIRECTORY',
+        academic_title=title,
+        affiliation=affiliation,
+        phone=extract_phone(local_block),
+        orcid=links.get('orcid', '') or extract_orcid_text(local_text),
+        google_scholar=links.get('google_scholar', ''),
+        scopus_author_id=extract_scopus(local_text),
+        pubmed=links.get('pubmed', ''),
+        profile_url=profile_url,
+        personal_homepage=links.get('personal_homepage', ''),
+        source_url=source_url,
+        country_source=country_source,
+        confidence=min(100, max(90, best_score)),
+        extraction_method=f'semantic_profile_v16:{email_kind}',
+        scrape_status='accepted',
+    )
+
+
+async def _v16_fetch_profile(context, rec: PersonRecord, sem: asyncio.Semaphore) -> Tuple[Optional[PersonRecord], Optional[Dict]]:
+    async with sem:
+        last_error = ''
+        for attempt in range(V16_PROFILE_FETCH_RETRIES + 1):
+            try:
+                r = await fetch_http(rec.profile_url)
+                if not r.get('ok'):
+                    r = await playwright_fetch(context, rec.profile_url)
+                if r.get('ok'):
+                    parsed = _v16_extract_profile(r.get('html', ''), r.get('url') or rec.profile_url, rec.source_url, rec.name)
+                    if parsed and normalize_email(parsed.email):
+                        return parsed, None
+                    return None, {
+                        'type': 'profile_no_verified_email',
+                        'source_url': rec.source_url,
+                        'profile_url': rec.profile_url,
+                        'name': rec.name,
+                    }
+                last_error = r.get('error', '')
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < V16_PROFILE_FETCH_RETRIES:
+                await asyncio.sleep(0.6 * (attempt + 1))
+        return None, {
+            'type': 'profile_fetch_failed',
+            'source_url': rec.source_url,
+            'profile_url': rec.profile_url,
+            'name': rec.name,
+            'error': excel_safe(last_error),
+        }
+
+
+async def scrape_generic_v16(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print('   [V16] Semantic profile discovery + universal pagination', flush=True)
+
+    # ---------------------------------------------------------
+    # Phase 1: gather listing states using BOTH direct URL pagination and browser interaction
+    # ---------------------------------------------------------
+    listing_states: List[Tuple[str, str]] = []
+    queue = [source_url]
+    queued = {normalize_url(source_url).casefold()}
+    visited = set()
+
+    while queue and len(listing_states) < V16_MAX_LISTING_STATES:
+        url = queue.pop(0)
+        key = normalize_url(url).casefold()
+        if key in visited:
+            continue
+        visited.add(key)
+        r = await fetch_http(url)
+        if not r.get('ok'):
+            r = await playwright_fetch(context, url)
+        if not r.get('ok'):
+            errors.append({'type': 'listing_fetch_failed', 'source_url': source_url, 'page_url': url, 'error': excel_safe(r.get('error', ''))})
+            continue
+        actual = r.get('url') or url
+        html = r.get('html', '')
+        listing_states.append((actual, html))
+        for nxt in _v16_url_pagination_candidates(html, actual, source_url):
+            nk = normalize_url(nxt).casefold()
+            if nk not in queued and nk not in visited:
+                queued.add(nk)
+                queue.append(nxt)
+
+    # Rendered pagination/Load-more/infinite-scroll, always attempted once because
+    # many institutional directories expose pagination only client-side.
+    try:
+        rendered_states = await _v16_browser_collect_listing_states(context, source_url, errors)
+        # merge by semantic signature
+        sig_seen = set()
+        merged_states = []
+        for u, h in listing_states + rendered_states:
+            sig = _v16_page_signature(h, u)
+            if sig not in sig_seen:
+                sig_seen.add(sig)
+                merged_states.append((u, h))
+        listing_states = merged_states[:V16_MAX_LISTING_STATES]
+    except Exception as exc:
+        errors.append({'type': 'pagination_warning', 'source_url': source_url, 'error': excel_safe(str(exc))})
+
+    # ---------------------------------------------------------
+    # Phase 2: collect direct email rows + semantic profile placeholders
+    # ---------------------------------------------------------
+    direct: List[PersonRecord] = []
+    placeholders: Dict[str, PersonRecord] = {}
+
+    for page_url, html in listing_states:
+        # Existing local email parser remains useful for pages that expose emails directly.
+        try:
+            _, rows = await parse_html(html, page_url, llm_enabled, llm_sem)
+            for r in rows:
+                if normalize_email(r.email):
+                    r.source_url = source_url
+                    direct.append(r)
+        except Exception as exc:
+            errors.append({'type': 'listing_parse_warning', 'source_url': source_url, 'page_url': page_url, 'error': excel_safe(str(exc))})
+
+        for p in discover_person_profiles_v16(html, page_url):
+            p.source_url = source_url
+            key = normalize_url(p.profile_url).casefold()
+            if not key:
+                continue
+            old = placeholders.get(key)
+            if old is None or (not old.name and p.name):
+                placeholders[key] = p
+            if len(placeholders) >= V16_MAX_PROFILES:
+                break
+
+    print(
+        f'   [DISCOVERY] listing_states={len(listing_states)} '
+        f'profiles={len(placeholders)} direct_email_rows={len(direct)}',
+        flush=True,
+    )
+
+    # ---------------------------------------------------------
+    # Phase 3: fetch EVERY unique discovered profile
+    # ---------------------------------------------------------
+    profile_items = list(placeholders.values())[:V16_MAX_PROFILES]
+    results = await asyncio.gather(*(_v16_fetch_profile(context, p, profile_sem) for p in profile_items))
+    profile_rows: List[PersonRecord] = []
+    for rec, diag in results:
+        if rec:
+            profile_rows.append(rec)
+        if diag:
+            errors.append(diag)
+
+    # ---------------------------------------------------------
+    # Phase 4: final merge and validation
+    # ---------------------------------------------------------
+    merged = dedupe_records_v14(direct + profile_rows)
+    final: List[PersonRecord] = []
+    for rec in merged:
+        rec.source_url = source_url
+        ok, reason = _v14_finalize_record(rec)
+        if ok:
+            final.append(rec)
+        else:
+            errors.append({
+                'type': 'rejected_record', 'reason': reason,
+                'name': excel_safe(rec.name), 'email': excel_safe(rec.email),
+                'country': excel_safe(rec.country), 'profile_url': excel_safe(rec.profile_url),
+                'source_url': source_url, 'method': excel_safe(rec.extraction_method),
+            })
+
+    final = dedupe_records_v14(final)
+    errors.append({
+        'type': 'email_coverage_summary',
+        'source_url': source_url,
+        'adapter': 'semantic_generic_v16',
+        'listing_states': len(listing_states),
+        'profiles_discovered': len(placeholders),
+        'profiles_with_email': len({r.profile_url for r in profile_rows if r.profile_url and r.email}),
+        'direct_email_rows': len(direct),
+        'final_rows': len(final),
+        'final_unique_emails': len({r.email for r in final if r.email}),
+    })
+    print(
+        f'   [V16 QUALITY] listing_states={len(listing_states)} '
+        f'profiles={len(placeholders)} profile_rows={len(profile_rows)} '
+        f'final={len(final)} unique_emails={len({r.email for r in final if r.email})}',
+        flush=True,
+    )
+    return final
+
 # -----------------------------------------------------------------------------
 # Final dispatcher
 # -----------------------------------------------------------------------------
@@ -7887,7 +8647,7 @@ async def scrape_source(
 
     else:
         print('   [ADAPTER] Universal email-first + profile-first parser', flush=True)
-        records = await scrape_generic_v12(
+        records = await scrape_generic_v16(
             context, source_url, llm_enabled, llm_sem, profile_sem, errors
         )
 
@@ -7921,760 +8681,6 @@ async def scrape_source(
         })
 
     return final
-
-
-
-# =============================================================================
-# V15 ROBUST UNIVERSAL UNIVERSITY PROFILE FOLLOWER
-# =============================================================================
-# Final generic override for university/staff/nanotechnology directories.
-# Special site adapters (USZ, EyeDoctors, cancer, psychiatry) remain intact.
-#
-# Core behavior:
-#   * listing -> discover person profile links -> open profile -> extract local email
-#   * support same-institution profile URLs even when they do not use /profile/
-#   * explicitly support Unibo /sitoweb/, Polito staff/personale links, ETH/EPFL/etc.
-#   * email is mandatory
-#   * personal email preferred over shared/role mailboxes
-#   * shared profile email is preserved only when explicitly present on that profile
-#   * HTTP -> robust request/browser fallback
-#   * profile fetch errors are logged, not fatal
-# =============================================================================
-
-from urllib.parse import parse_qs
-from datetime import datetime
-import os
-import time
-
-V15_PROFILE_CONCURRENCY = max(4, PROFILE_CONCURRENCY)
-V15_MAX_PROFILES_PER_SOURCE = 2500
-V15_MAX_LISTING_PAGES = 50
-V15_PROFILE_RETRIES = 3
-
-V15_SOCIAL_HOSTS = {
-    "linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
-    "youtube.com", "researchgate.net", "orcid.org", "scholar.google.com",
-    "scopus.com", "pubmed.ncbi.nlm.nih.gov", "doi.org",
-}
-
-V15_BAD_PATH_PARTS = (
-    "/news/", "/event/", "/events/", "/search", "/privacy", "/cookie",
-    "/cookies", "/contact", "/about", "/login", "/logout", "/category/",
-    "/tag/", "/download", "/downloads", ".pdf", ".doc", ".docx", ".zip",
-)
-
-V15_PROFILE_PATH_HINTS = (
-    "/sitoweb/", "/personale/scheda/", "/people/", "/person/", "/persons/",
-    "/profile/", "/profiles/", "/staff/", "/faculty/", "/team/", "/member/",
-    "/members/", "/researcher/", "/researchers/", "/scientist/", "/scientists/",
-    "/doctoral/", "/phd/", "/employee/", "/employees/", "/collaborator/",
-)
-
-V15_KNOWN_ORG_ROOTS = (
-    "unibo.it", "cnr.it", "uniud.it", "unive.it", "polito.it", "ethz.ch",
-    "unibas.ch", "epfl.ch", "fhnw.ch", "psi.ch", "ami.swiss",
-)
-
-
-def _v15_host(url: str) -> str:
-    try:
-        return urlparse(normalize_url(url)).netloc.casefold().split(":")[0].replace("www.", "")
-    except Exception:
-        return ""
-
-
-def _v15_org_root(url: str) -> str:
-    host = _v15_host(url)
-    if not host:
-        return ""
-    for root in V15_KNOWN_ORG_ROOTS:
-        if host == root or host.endswith("." + root):
-            return root
-    parts = [p for p in host.split(".") if p]
-    if len(parts) <= 2:
-        return host
-    # conservative fallback sufficient for most academic hosts
-    return ".".join(parts[-2:])
-
-
-def _v15_same_institution(url1: str, url2: str) -> bool:
-    r1 = _v15_org_root(url1)
-    r2 = _v15_org_root(url2)
-    return bool(r1 and r2 and r1 == r2)
-
-
-def _v15_external_bad_url(url: str) -> bool:
-    if not url:
-        return True
-    p = urlparse(url)
-    host = p.netloc.casefold().replace("www.", "")
-    path = (p.path or "").casefold()
-    for social in V15_SOCIAL_HOSTS:
-        s = social.replace("www.", "")
-        if host == s or host.endswith("." + s):
-            return True
-    if any(token in path for token in V15_BAD_PATH_PARTS):
-        return True
-    return False
-
-
-def _v15_clean_person_name(value: str) -> str:
-    value = clean_text(value)
-    if not value:
-        return ""
-    value = re.sub(
-        r"^\s*(?:(?:prof(?:essor)?|dr|doctor|mr|mrs|ms|miss|pd|ing|dipl)\.?\s+)+",
-        "", value, flags=re.I,
-    )
-    value = clean_person_name_candidate(value)
-    return value if plausible_name(value) else ""
-
-
-def _v15_anchor_name(anchor: Tag) -> str:
-    candidates = [
-        clean_text(anchor.get_text(" ", strip=True)),
-        clean_text(anchor.get("aria-label", "")),
-        clean_text(anchor.get("title", "")),
-    ]
-    img = anchor.select_one("img[alt]")
-    if img:
-        candidates.append(clean_text(img.get("alt", "")))
-    for candidate in candidates:
-        name = _v15_clean_person_name(candidate)
-        if name:
-            return name
-    return ""
-
-
-def _v15_profile_link_score(anchor: Tag, listing_url: str, inside_person_block: bool = False) -> Tuple[int, str, str]:
-    href = clean_text(anchor.get("href", ""))
-    if not href or href.casefold().startswith(("#", "mailto:", "tel:", "javascript:")):
-        return 0, "", ""
-
-    profile_url = normalize_url(urljoin(listing_url, href))
-    if not profile_url.startswith(("http://", "https://")):
-        return 0, "", ""
-    if _v15_external_bad_url(profile_url):
-        return 0, "", ""
-    if normalize_url(profile_url).rstrip("/") == normalize_url(listing_url).rstrip("/"):
-        return 0, "", ""
-
-    name = _v15_anchor_name(anchor)
-    if not name:
-        return 0, "", ""
-
-    parsed = urlparse(profile_url)
-    path = (parsed.path or "").casefold()
-    query = parse_qs(parsed.query)
-    score = 0
-
-    if _v15_same_institution(profile_url, listing_url):
-        score += 70
-    if any(h in path for h in V15_PROFILE_PATH_HINTS):
-        score += 80
-
-    # Common patterns in current nano/chemistry inputs.
-    if "/sitoweb/" in path:                         # University of Bologna
-        score += 120
-    if "/personale/scheda/" in path:               # Politecnico di Torino
-        score += 120
-    if "/staff" in path and query.get("p"):        # Polito variant
-        score += 120
-    if "people" in path and len([x for x in path.split("/") if x]) >= 2:
-        score += 35
-
-    tokens = _name_tokens(name)
-    if len(tokens) >= 2:
-        score += 40
-    if inside_person_block:
-        score += 45
-
-    segments = [x for x in path.split("/") if x]
-    if segments:
-        last = segments[-1]
-        if re.search(r"[a-z]+[._-][a-z]+", last, flags=re.I) and len(tokens) >= 2:
-            score += 30
-
-    return score, profile_url, name
-
-
-def discover_profiles_v15(html: str, listing_url: str) -> List[PersonRecord]:
-    soup = BeautifulSoup(html or "", "html.parser")
-    records: List[PersonRecord] = []
-    seen_profiles = set()
-
-    structured_selectors = (
-        "article, li, tr, .card, .person, .people-item, .person-card, .staff, "
-        ".staff-member, .staff-item, .faculty, .faculty-member, .team-member, "
-        ".member, .member-item, .researcher, .profile-card, .directory-item, "
-        "[class*='person'], [class*='staff'], [class*='faculty'], [class*='member']"
-    )
-
-    for block in soup.select(structured_selectors):
-        text = clean_text(block.get_text(" ", strip=True))
-        if not text or len(text) > 3000:
-            continue
-        best = (0, "", "")
-        for anchor in block.select("a[href]"):
-            candidate = _v15_profile_link_score(anchor, listing_url, inside_person_block=True)
-            if candidate[0] > best[0]:
-                best = candidate
-        score, profile_url, name = best
-        if score < 100 or not profile_url or not name:
-            continue
-        key = profile_url.casefold()
-        if key in seen_profiles:
-            continue
-        seen_profiles.add(key)
-
-        title = ""
-        for sel in (".title", ".role", ".position", ".job-title", ".academic-title", "h3 + p", "h4 + p"):
-            el = block.select_one(sel)
-            if el:
-                value = clean_text(el.get_text(" ", strip=True))
-                if value and value != name and len(value) <= 250:
-                    title = value
-                    break
-
-        records.append(PersonRecord(
-            name=name,
-            page_type="UNIVERSITY_DIRECTORY",
-            academic_title=title,
-            profile_url=profile_url,
-            source_url=listing_url,
-            confidence=min(95, 55 + score // 3),
-            extraction_method="profile_discovery_v15",
-        ))
-        if len(records) >= V15_MAX_PROFILES_PER_SOURCE:
-            break
-
-    if len(records) < V15_MAX_PROFILES_PER_SOURCE:
-        standalone = (
-            "h1 a[href], h2 a[href], h3 a[href], h4 a[href], h5 a[href], "
-            "[class*='name'] a[href], a[href*='/sitoweb/'], "
-            "a[href*='/personale/scheda/'], a[href*='/people/'], "
-            "a[href*='/person/'], a[href*='/profile/'], a[href*='/staff']"
-        )
-        for anchor in soup.select(standalone):
-            score, profile_url, name = _v15_profile_link_score(anchor, listing_url, inside_person_block=False)
-            if score < 105:
-                continue
-            key = profile_url.casefold()
-            if key in seen_profiles:
-                continue
-            seen_profiles.add(key)
-            records.append(PersonRecord(
-                name=name,
-                page_type="UNIVERSITY_DIRECTORY",
-                profile_url=profile_url,
-                source_url=listing_url,
-                confidence=min(95, 50 + score // 3),
-                extraction_method="profile_discovery_v15",
-            ))
-            if len(records) >= V15_MAX_PROFILES_PER_SOURCE:
-                break
-
-    return records
-
-
-def _v15_listing_pagination_urls(html: str, current_url: str, source_url: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "html.parser")
-    urls: List[str] = []
-    selectors = (
-        "a[rel='next'], .pagination a[href], .pager a[href], .pagination-next a[href], "
-        "nav[aria-label*='pagination'] a[href], nav[aria-label*='Pagination'] a[href]"
-    )
-    for a in soup.select(selectors):
-        href = clean_text(a.get("href", ""))
-        if not href:
-            continue
-        url = normalize_url(urljoin(current_url, href))
-        if not url.startswith(("http://", "https://")):
-            continue
-        if not _v15_same_institution(url, source_url):
-            continue
-        if url not in urls:
-            urls.append(url)
-    return urls
-
-
-async def _v15_fetch_url(context, url: str, force_browser: bool = False) -> Dict:
-    last_error = ""
-
-    # V14 robust cascade: requests -> context.request -> browser page.
-    if not force_browser:
-        try:
-            r = await fetch_robust_v14(context, [url])
-            if r.get("ok"):
-                return r
-            last_error = r.get("error", "")
-        except Exception as exc:
-            last_error = str(exc)
-
-    # V11 helper can be useful for JS-heavy institutional sites.
-    try:
-        r = await _v11_fetch_html(context, url, force_browser=force_browser)
-        if r.get("ok"):
-            return r
-        last_error = r.get("error", "") or last_error
-    except Exception as exc:
-        last_error = str(exc)
-
-    try:
-        r = await playwright_fetch(context, url)
-        if r.get("ok"):
-            return r
-        last_error = r.get("error", "") or last_error
-    except Exception as exc:
-        last_error = str(exc)
-
-    return {"ok": False, "html": "", "url": url, "error": last_error}
-
-
-def extract_profile_v15(html: str, profile_url: str, source_url: str, name_hint: str = "") -> Optional[PersonRecord]:
-    soup = BeautifulSoup(html or "", "html.parser")
-    root = (
-        soup.select_one("main") or soup.select_one("article") or soup.select_one("#main-content")
-        or soup.select_one("#content") or soup.select_one(".main-content") or soup.body or soup
-    )
-
-    # Name: listing hint + profile structured headings.
-    name = ""
-    try:
-        name = _v11_extract_profile_name(soup, name_hint)
-    except Exception:
-        pass
-    if not name:
-        for sel in ("[itemprop='name']", "main h1", "article h1", ".person-name", ".profile-name", ".staff-name", "h1"):
-            el = soup.select_one(sel)
-            if el:
-                candidate = _v15_clean_person_name(el.get_text(" ", strip=True))
-                if candidate:
-                    name = candidate
-                    break
-    if not name:
-        name = _v15_clean_person_name(name_hint)
-
-    # Email evidence before normalize_dom() removes script/JSON-LD.
-    evidence = []
-    try:
-        evidence = _v11_extract_email_evidence(root)
-    except Exception:
-        pass
-
-    if not evidence:
-        for a in root.select('a[href^="mailto:"], a[href^="MAILTO:"]'):
-            email = normalize_email(a.get("href", "")) or normalize_email(a.get_text(" ", strip=True))
-            if email:
-                evidence.append((190, email, a, "mailto_v15"))
-
-    ranked = []
-    for base_score, raw_email, node, method in evidence:
-        email = normalize_email(raw_email)
-        if not email:
-            continue
-        score = int(base_score)
-        if name:
-            score += min(50, email_name_score(name, email))
-
-        context_text = ""
-        if node is not None:
-            try:
-                local = _nearest_person_container(node, email, max_chars=1200)
-                context_text = clean_text(local.get_text(" ", strip=True)).casefold()
-            except Exception:
-                pass
-
-        if context_text:
-            if any(x in context_text for x in (
-                "webmaster", "press office", "media contact", "general information",
-                "general enquiries", "general inquiries", "privacy", "cookie",
-            )):
-                score -= 150
-            if name:
-                tokens = _name_tokens(name)
-                if any(token in context_text for token in tokens):
-                    score += 30
-
-        if _v14_is_shared_email(email):
-            score -= 30
-
-        ranked.append((score, email, node, method))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    if not ranked:
-        return None
-
-    best_score, email, email_node, email_method = ranked[0]
-    if best_score < 90:
-        return None
-
-    alternates = []
-    for score, candidate_email, _, _ in ranked[1:]:
-        if candidate_email != email and score >= 110 and candidate_email not in alternates:
-            alternates.append(candidate_email)
-
-    clean_soup = BeautifulSoup(html or "", "html.parser")
-    normalize_dom(clean_soup)
-    clean_root = (
-        clean_soup.select_one("main") or clean_soup.select_one("article") or clean_soup.select_one("#main-content")
-        or clean_soup.select_one("#content") or clean_soup.body or clean_soup
-    )
-
-    links = extract_links(clean_root, profile_url)
-    phone = extract_phone(clean_root)
-
-    academic_title = ""
-    for sel in (".job-title", ".person-title", ".profile-title", ".role", ".position", "[class*='title']", "main h2", "article h2"):
-        el = clean_root.select_one(sel)
-        if el:
-            value = clean_text(el.get_text(" ", strip=True))
-            if value and value != name and len(value) <= 250:
-                academic_title = value
-                break
-
-    affiliation = ""
-    if email_node is not None:
-        try:
-            local = _nearest_person_container(email_node, email, max_chars=1400)
-            affiliation = split_affiliation_from_block(local, name, [email] + alternates, "")
-        except Exception:
-            pass
-    affiliation = clean_text(affiliation)[:700]
-
-    country = country_from_tld(email)
-    country_source = "email_tld" if country else ""
-    host = _v15_host(profile_url)
-    site_country = {
-        "unibo.it": "Italy", "cnr.it": "Italy", "uniud.it": "Italy",
-        "unive.it": "Italy", "polito.it": "Italy",
-        "ethz.ch": "Switzerland", "unibas.ch": "Switzerland", "epfl.ch": "Switzerland",
-        "fhnw.ch": "Switzerland", "psi.ch": "Switzerland", "ami.swiss": "Switzerland",
-    }
-    if not country:
-        for root_domain, value in site_country.items():
-            if host == root_domain or host.endswith("." + root_domain):
-                country = value
-                country_source = "trusted_institution_domain"
-                break
-
-    return PersonRecord(
-        name=name or "",
-        email=email,
-        country=country,
-        alternate_emails=" | ".join(unique(alternates)),
-        email_type="shared/role" if _v14_is_shared_email(email) else "personal",
-        email_conflict="no",
-        page_type="UNIVERSITY_DIRECTORY",
-        academic_title=academic_title,
-        affiliation=affiliation,
-        phone=phone,
-        orcid=links.get("orcid", ""),
-        google_scholar=links.get("google_scholar", ""),
-        pubmed=links.get("pubmed", ""),
-        personal_homepage=links.get("personal_homepage", ""),
-        profile_url=profile_url,
-        source_url=source_url,
-        country_source=country_source,
-        confidence=98,
-        extraction_method=f"profile_v15:{email_method}",
-        scrape_status="accepted",
-    )
-
-
-async def _v15_fetch_profiles(
-    context,
-    placeholders: List[PersonRecord],
-    profile_sem: asyncio.Semaphore,
-    errors: List[Dict],
-    source_url: str,
-) -> List[PersonRecord]:
-    unique_profiles = []
-    seen = set()
-    for rec in placeholders:
-        url = normalize_url(rec.profile_url)
-        key = url.casefold() if url else ""
-        if key and key not in seen:
-            seen.add(key)
-            unique_profiles.append(rec)
-
-    print(f"   [PROFILE DISCOVERY] {len(unique_profiles)} unique profiles", flush=True)
-
-    async def one(placeholder: PersonRecord):
-        async with profile_sem:
-            last_error = ""
-            for attempt in range(1, V15_PROFILE_RETRIES + 1):
-                try:
-                    result = await _v15_fetch_url(context, placeholder.profile_url)
-                    if result.get("ok"):
-                        final_url = result.get("url") or placeholder.profile_url
-                        record = extract_profile_v15(
-                            result.get("html", ""), final_url, source_url, placeholder.name
-                        )
-                        if record:
-                            if not record.name and placeholder.name:
-                                record.name = _v15_clean_person_name(placeholder.name)
-                            return record, None
-                        return None, {
-                            "type": "profile_no_verified_email",
-                            "source_url": source_url,
-                            "profile_url": placeholder.profile_url,
-                            "name": placeholder.name,
-                        }
-                    last_error = result.get("error", "")
-                except Exception as exc:
-                    last_error = str(exc)
-                if attempt < V15_PROFILE_RETRIES:
-                    await asyncio.sleep(0.75 * attempt)
-
-            return None, {
-                "type": "profile_fetch_failed",
-                "source_url": source_url,
-                "profile_url": placeholder.profile_url,
-                "name": placeholder.name,
-                "error": excel_safe(last_error),
-            }
-
-    results = await asyncio.gather(*(one(rec) for rec in unique_profiles))
-    records = []
-    for rec, diagnostic in results:
-        if rec:
-            records.append(rec)
-        if diagnostic:
-            errors.append(diagnostic)
-    return dedupe_records_v14(records)
-
-
-async def scrape_generic_v15(
-    context,
-    source_url: str,
-    llm_enabled: bool,
-    llm_sem: asyncio.Semaphore,
-    profile_sem: asyncio.Semaphore,
-    errors: List[Dict],
-) -> List[PersonRecord]:
-    print("   [V15] Robust listing -> profile -> email crawler", flush=True)
-
-    listing_queue = [source_url]
-    queued = {normalize_url(source_url)}
-    visited = set()
-
-    placeholders: List[PersonRecord] = []
-    direct_records: List[PersonRecord] = []
-    email_first_records: List[PersonRecord] = []
-    listing_pages_fetched = 0
-
-    while listing_queue and len(visited) < V15_MAX_LISTING_PAGES:
-        current_url = listing_queue.pop(0)
-        normalized_current = normalize_url(current_url)
-        if normalized_current in visited:
-            continue
-        visited.add(normalized_current)
-
-        print(f"   [LISTING] {current_url}", flush=True)
-        result = await _v15_fetch_url(context, current_url)
-        if not result.get("ok"):
-            errors.append({
-                "type": "listing_fetch_failed",
-                "source_url": source_url,
-                "page_url": current_url,
-                "error": excel_safe(result.get("error", "")),
-            })
-            continue
-
-        listing_pages_fetched += 1
-        actual_url = result.get("url") or current_url
-        html = result.get("html", "")
-
-        # Existing parser can still capture direct listing emails.
-        try:
-            _, existing = await parse_html(html, actual_url, llm_enabled, llm_sem)
-            direct_records.extend([r for r in existing if normalize_email(r.email)])
-        except Exception as exc:
-            errors.append({
-                "type": "listing_parse_warning",
-                "source_url": source_url,
-                "page_url": actual_url,
-                "error": excel_safe(str(exc)),
-            })
-
-        # Email-first safety net.
-        try:
-            email_first_records.extend(harvest_email_first_records_v12(html, source_url))
-        except Exception:
-            pass
-
-        found_profiles = discover_profiles_v15(html, actual_url)
-        print(f"   [PROFILE LINKS] page={len(found_profiles)}", flush=True)
-        placeholders.extend(found_profiles)
-
-        # HTTP may return incomplete shell; force rendered DOM when profile discovery is empty.
-        if not found_profiles:
-            browser_result = await _v15_fetch_url(context, current_url, force_browser=True)
-            if browser_result.get("ok"):
-                browser_html = browser_result.get("html", "")
-                browser_url = browser_result.get("url") or current_url
-                rendered_profiles = discover_profiles_v15(browser_html, browser_url)
-                if rendered_profiles:
-                    print(f"   [RENDERED PROFILE LINKS] {len(rendered_profiles)}", flush=True)
-                    placeholders.extend(rendered_profiles)
-                    html = browser_html
-                    actual_url = browser_url
-                try:
-                    email_first_records.extend(harvest_email_first_records_v12(browser_html, source_url))
-                except Exception:
-                    pass
-
-        if FOLLOW_PAGINATION:
-            for next_url in _v15_listing_pagination_urls(html, actual_url, source_url):
-                normalized_next = normalize_url(next_url)
-                if normalized_next not in queued and normalized_next not in visited:
-                    queued.add(normalized_next)
-                    listing_queue.append(next_url)
-
-    # Unique profiles.
-    placeholder_map: Dict[str, PersonRecord] = {}
-    for rec in placeholders:
-        key = normalize_url(rec.profile_url).casefold()
-        if not key:
-            continue
-        if key not in placeholder_map:
-            placeholder_map[key] = rec
-        elif not placeholder_map[key].name and rec.name:
-            placeholder_map[key].name = rec.name
-
-    placeholders = list(placeholder_map.values())[:V15_MAX_PROFILES_PER_SOURCE]
-    profile_records = await _v15_fetch_profiles(
-        context, placeholders, profile_sem, errors, source_url
-    )
-
-    combined = direct_records + profile_records + email_first_records
-    final: List[PersonRecord] = []
-
-    for rec in dedupe_records_v14(combined):
-        rec.source_url = source_url
-        ok, reason = _v14_finalize_record(rec)
-        if ok:
-            final.append(rec)
-        else:
-            errors.append({
-                "type": "rejected_record",
-                "reason": reason,
-                "name": excel_safe(rec.name),
-                "email": excel_safe(rec.email),
-                "profile_url": excel_safe(rec.profile_url),
-                "source_url": source_url,
-                "method": excel_safe(rec.extraction_method),
-            })
-
-    final = dedupe_records_v14(final)
-
-    errors.append({
-        "type": "email_coverage_summary",
-        "source_url": source_url,
-        "adapter": "generic_profile_v15",
-        "listing_pages_fetched": listing_pages_fetched,
-        "profiles_discovered": len(placeholders),
-        "profiles_with_email": len({r.profile_url for r in profile_records if r.profile_url and r.email}),
-        "profiles_without_email": sum(
-            1 for item in errors
-            if item.get("source_url") == source_url and item.get("type") == "profile_no_verified_email"
-        ),
-        "profile_fetch_failed": sum(
-            1 for item in errors
-            if item.get("source_url") == source_url and item.get("type") == "profile_fetch_failed"
-        ),
-        "listing_direct_records": len(direct_records),
-        "email_first_records": len(email_first_records),
-        "final_rows": len(final),
-        "final_unique_emails": len({normalize_email(r.email) for r in final if normalize_email(r.email)}),
-    })
-
-    print(
-        f"   [V15 QUALITY] listing_pages={listing_pages_fetched} "
-        f"profiles={len(placeholders)} profile_emails={len(profile_records)} "
-        f"final={len(final)} unique_emails={len({r.email for r in final if r.email})}",
-        flush=True,
-    )
-
-    return final
-
-
-# Redirect the existing V14 dispatcher generic branch to V15.
-scrape_generic_v12 = scrape_generic_v15
-
-
-# =============================================================================
-# V15 ROBUST EXCEL SAVE OVERRIDE
-# =============================================================================
-# Prevents Windows PermissionError when the target workbook is open in Excel.
-# If locked, save a timestamped fallback instead of crashing after the scrape.
-# =============================================================================
-
-def save_excel(records: List[PersonRecord]):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Scraped Data"
-    ws.append([excel_safe(c) for c in COLUMNS])
-
-    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
-    font = Font(bold=True, color="FFFFFF")
-    for c in ws[1]:
-        c.fill = fill
-        c.font = font
-        c.alignment = Alignment(horizontal="center", vertical="center")
-
-    for r in records:
-        data = asdict(r)
-        ws.append([excel_safe(data.get(c, "")) for c in COLUMNS])
-
-    widths = {
-        "A": 42, "B": 42, "C": 22, "D": 55, "E": 18, "F": 14,
-        "G": 18, "H": 38, "I": 24, "J": 48, "K": 32, "L": 32, "M": 26,
-        "N": 28, "O": 75, "P": 50, "Q": 45, "R": 45, "S": 50, "T": 50,
-        "U": 42, "V": 24, "W": 65, "X": 24, "Y": 65, "Z": 65, "AA": 24,
-        "AB": 24, "AC": 65, "AD": 65, "AE": 85, "AF": 25, "AG": 14,
-        "AH": 28, "AI": 20, "AJ": 20,
-    }
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    XLSX_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_file = XLSX_FILE.with_name(f"{XLSX_FILE.stem}.__writing__.xlsx")
-    try:
-        if temp_file.exists():
-            temp_file.unlink()
-    except Exception:
-        pass
-
-    wb.save(temp_file)
-
-    for attempt in range(1, 6):
-        try:
-            os.replace(temp_file, XLSX_FILE)
-            print(f"   [EXCEL SAVED] {XLSX_FILE.resolve()}", flush=True)
-            return XLSX_FILE
-        except PermissionError:
-            print(f"   [EXCEL LOCKED] attempt {attempt}/5: {XLSX_FILE.name}", flush=True)
-            if attempt < 5:
-                time.sleep(2)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fallback = XLSX_FILE.with_name(f"{XLSX_FILE.stem}_NEW_{timestamp}.xlsx")
-    try:
-        os.replace(temp_file, fallback)
-    except Exception:
-        wb.save(fallback)
-
-    print(
-        f"\n[WARNING] Target Excel is locked. Data was saved to:\n{fallback.resolve()}\n",
-        flush=True,
-    )
-    return fallback
-
 
 
 if __name__ == '__main__':
