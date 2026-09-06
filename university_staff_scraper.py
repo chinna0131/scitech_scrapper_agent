@@ -41,7 +41,7 @@ HEADLESS = True
 HTTP_TIMEOUT = 25
 PLAYWRIGHT_TIMEOUT = 25_000
 PROFILE_TIMEOUT = 25_000
-PROFILE_CONCURRENCY = 2
+PROFILE_CONCURRENCY = 4
 FOLLOW_PAGINATION = True
 MAX_PAGES_PER_URL = 20
 MAX_SCROLL_ROUNDS = 10
@@ -7986,10 +7986,53 @@ def _v16_person_container(anchor: Tag) -> Optional[Tag]:
     return best or (anchor.parent if isinstance(anchor.parent, Tag) else anchor)
 
 
+def _v16_nonperson_label(name: str) -> bool:
+    """
+    Reject obvious navigation/section/service labels before profile fetching.
+    This is semantic text filtering only; it does NOT depend on URL format.
+    """
+    n = clean_text(name).casefold().strip(" :;,.|-")
+    if not n:
+        return True
+
+    exact = {
+        "study", "research", "about", "about us", "contact", "give", "donate",
+        "engage", "education", "library", "faculties", "campuses",
+        "partners and community", "uq home", "uq news", "staff intranet",
+        "it support", "student support", "study and learning support",
+        "research and publish", "make a complaint", "web login", "feedback",
+        "accessibility", "right to information", "academic calendar",
+        "find a subject matter expert", "careers and job search", "strategic plan",
+        "professional staff", "group leaders", "researchers",
+    }
+    if n in exact:
+        return True
+
+    bad_starts = (
+        "about ", "contact ", "study ", "research ", "student ", "staff ",
+        "professional staff", "group leaders", "researchers", "careers ",
+        "admissions ", "faculties", "campuses", "library", "news", "events",
+        "privacy", "accessibility", "feedback", "web login", "support",
+    )
+    if n.startswith(bad_starts):
+        return True
+
+    # Group/section pages are not individual people.
+    if n.endswith((" group", " team", " staff", " students", " researchers", " members")):
+        return True
+
+    return False
+
+
 def _v16_score_person_link(anchor: Tag, source_url: str) -> Tuple[int, str, str]:
     href = clean_text(anchor.get('href', ''))
     if not href or href.casefold().startswith(('#', 'mailto:', 'tel:', 'javascript:')):
         return 0, '', ''
+
+    # Never classify global navigation/footer links as people.
+    if anchor.find_parent(["nav", "header", "footer", "aside"]) is not None:
+        return 0, '', ''
+
     url = normalize_url(urljoin(source_url, href))
     if not url.startswith(('http://', 'https://')) or _v16_bad_target(url):
         return 0, '', ''
@@ -7997,37 +8040,70 @@ def _v16_score_person_link(anchor: Tag, source_url: str) -> Tuple[int, str, str]
         return 0, '', ''
 
     name = _v16_name_from_anchor(anchor)
-    if not name:
+    if not name or _v16_nonperson_label(name):
         return 0, '', ''
 
-    score = 60  # human name on link is the main signal
     tokens = _name_tokens(name)
-    if len(tokens) >= 2:
-        score += 25
+    if len(tokens) < 2:
+        return 0, '', ''
+
+    # Semantic/structural scoring. Same-domain alone can never make a link a person.
+    score = 20
+    score += min(35, len(tokens) * 10)
 
     block = _v16_person_container(anchor)
+    structural_evidence = 0
     if block is not None:
         btxt = clean_text(block.get_text(' ', strip=True)).casefold()
-        if any(cue in btxt for cue in V16_PERSON_CUES):
-            score += 25
         cls = ' '.join(block.get('class', [])).casefold()
-        if any(k in cls for k in ('person', 'people', 'staff', 'faculty', 'member', 'team', 'profile', 'card', 'researcher')):
-            score += 25
 
-    # Same institution is a strong hint, but NOT a requirement.
+        if any(cue in btxt for cue in V16_PERSON_CUES):
+            score += 35
+            structural_evidence += 1
+
+        if any(k in cls for k in (
+            'person', 'people', 'staff', 'faculty', 'member',
+            'profile', 'researcher', 'people-card', 'person-card'
+        )):
+            score += 35
+            structural_evidence += 1
+
+        # A compact card containing a person heading is useful evidence.
+        if len(btxt) <= 1800 and block.select_one("h2,h3,h4,h5,[itemprop='name'],[class*='name']"):
+            score += 15
+            structural_evidence += 1
+
+    # Name anchor itself in a heading is strong structural evidence.
+    if anchor.find_parent(["h1", "h2", "h3", "h4", "h5"]) is not None:
+        score += 20
+        structural_evidence += 1
+
+    # Academic honorific/title in visible name is useful, but not required.
+    if re.search(
+        r"\b(?:prof(?:essor)?|associate professor|assistant professor|dr|doctor|"
+        r"mr|mrs|ms|miss|hon assoc professor)\b",
+        clean_text(anchor.get_text(" ", strip=True)),
+        re.I,
+    ):
+        score += 20
+        structural_evidence += 1
+
+    # Same institution is only a supporting hint.
     if _v16_same_org(source_url, url):
-        score += 35
+        score += 20
     else:
-        # external links are allowed only when very strongly person-associated
-        score -= 15
+        score -= 10
 
-    # Conventional profile-like URL is only a hint, never a requirement.
+    # URL shape is deliberately only a tiny hint.
     path = (urlparse(url).path or '').casefold()
-    if any(x in path for x in ('profile', 'people', 'person', 'staff', 'faculty', 'team', 'member', 'researcher', 'sitoweb')):
-        score += 10
+    if any(x in path for x in ('profile', 'people', 'person', 'staff', 'faculty', 'member', 'researcher', 'sitoweb')):
+        score += 5
+
+    # A name-like anchor with no person structure is usually navigation/content.
+    if structural_evidence == 0:
+        score -= 35
 
     return score, url, name
-
 
 def discover_person_profiles_v16(html: str, source_url: str) -> List[PersonRecord]:
     soup = BeautifulSoup(html or '', 'html.parser')
@@ -8430,35 +8506,183 @@ def _v16_extract_profile(html: str, profile_url: str, source_url: str, name_hint
     )
 
 
+def _v16_secondary_profile_candidates(html: str, current_url: str, expected_name: str) -> List[str]:
+    """
+    Discover a small number of authoritative same-person contact/profile pages.
+
+    This is intentionally semantic:
+      - link text/aria/title says researcher/profile/expert
+      - or anchor text matches the expected person's name
+      - social/publication/document links are excluded
+    URL path format is not prescribed.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    expected_tokens = set(_name_tokens(expected_name))
+    scored = []
+
+    for a in soup.select("a[href]"):
+        href = clean_text(a.get("href", ""))
+        if not href or href.casefold().startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+
+        url = normalize_url(urljoin(current_url, href))
+        if not url.startswith(("http://", "https://")):
+            continue
+        if normalize_url(url).rstrip("/") == normalize_url(current_url).rstrip("/"):
+            continue
+        if _v16_bad_target(url):
+            continue
+
+        host = _v16_host(url)
+        if any(x in host for x in (
+            "espace.library.", "doi.org", "pubmed.", "orcid.org",
+            "researchgate.", "linkedin.", "facebook.", "instagram.",
+            "twitter.", "x.com", "youtube."
+        )):
+            continue
+
+        text = clean_text(
+            a.get_text(" ", strip=True)
+            or a.get("aria-label", "")
+            or a.get("title", "")
+        )
+        low = text.casefold()
+
+        score = 0
+        if any(x in low for x in (
+            "researcher profile", "research profile", "staff profile",
+            "academic profile", "expert profile", "view researcher",
+            "view profile", "uq experts"
+        )):
+            score += 120
+
+        candidate_name = clean_person_name_candidate(text)
+        if candidate_name and plausible_name(candidate_name) and expected_tokens:
+            ct = set(_name_tokens(candidate_name))
+            if ct and expected_tokens & ct:
+                score += 80
+
+        # Related institutional domains are preferred, but this is not mandatory.
+        if _v16_same_org(current_url, url):
+            score += 25
+
+        if score >= 80:
+            scored.append((score, url))
+
+    out = []
+    seen = set()
+    for _, url in sorted(scored, key=lambda x: x[0], reverse=True):
+        key = normalize_url(url).casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(url)
+    return out[:4]
+
+
 async def _v16_fetch_profile(context, rec: PersonRecord, sem: asyncio.Semaphore) -> Tuple[Optional[PersonRecord], Optional[Dict]]:
+    """
+    Fetch a discovered person profile.
+
+    Critical fix:
+    HTTP 200 does NOT mean the profile DOM is complete. If HTTP HTML produces no
+    verified email, retry the same profile with Playwright, then follow a small
+    set of same-person researcher/expert profile links.
+    """
     async with sem:
-        last_error = ''
-        for attempt in range(V16_PROFILE_FETCH_RETRIES + 1):
+        last_error = ""
+        attempted_urls = set()
+        primary_html = ""
+        primary_final_url = rec.profile_url
+
+        async def try_parse(url: str, force_browser: bool = False):
+            nonlocal last_error
+            key = (normalize_url(url).casefold(), bool(force_browser))
+            if key in attempted_urls:
+                return None, "", url
+            attempted_urls.add(key)
+
             try:
-                r = await fetch_http(rec.profile_url)
-                if not r.get('ok'):
-                    r = await playwright_fetch(context, rec.profile_url)
-                if r.get('ok'):
-                    parsed = _v16_extract_profile(r.get('html', ''), r.get('url') or rec.profile_url, rec.source_url, rec.name)
-                    if parsed and normalize_email(parsed.email):
-                        return parsed, None
-                    return None, {
-                        'type': 'profile_no_verified_email',
-                        'source_url': rec.source_url,
-                        'profile_url': rec.profile_url,
-                        'name': rec.name,
-                    }
-                last_error = r.get('error', '')
+                if force_browser:
+                    r = await playwright_fetch(context, url)
+                else:
+                    r = await fetch_http(url)
+
+                if not r.get("ok"):
+                    last_error = r.get("error", "")
+                    return None, r.get("html", "") or "", r.get("url") or url
+
+                html = r.get("html", "") or ""
+                final_url = r.get("url") or url
+                parsed = _v16_extract_profile(
+                    html,
+                    final_url,
+                    rec.source_url,
+                    rec.name,
+                )
+                if parsed and normalize_email(parsed.email):
+                    return parsed, html, final_url
+
+                return None, html, final_url
             except Exception as exc:
                 last_error = str(exc)
-            if attempt < V16_PROFILE_FETCH_RETRIES:
-                await asyncio.sleep(0.6 * (attempt + 1))
+                return None, "", url
+
+        # 1) HTTP first
+        parsed, primary_html, primary_final_url = await try_parse(rec.profile_url, False)
+        if parsed:
+            return parsed, None
+
+        # 2) HTTP may be a successful but incomplete shell. Render the SAME profile.
+        parsed, rendered_html, rendered_url = await try_parse(rec.profile_url, True)
+        if parsed:
+            parsed.extraction_method = (
+                f"{parsed.extraction_method}+rendered_profile_retry"
+                if parsed.extraction_method else "rendered_profile_retry"
+            )
+            return parsed, None
+
+        best_html = rendered_html or primary_html
+        best_url = rendered_url or primary_final_url or rec.profile_url
+
+        # 3) Some microsites expose contact details only on an authoritative
+        # researcher/expert page linked from the local profile.
+        secondary_urls = _v16_secondary_profile_candidates(
+            best_html,
+            best_url,
+            rec.name,
+        )
+
+        for second_url in secondary_urls:
+            # HTTP secondary
+            parsed2, html2, final2 = await try_parse(second_url, False)
+            if parsed2:
+                # Keep the original listed profile; store authoritative contact page separately.
+                parsed2.personal_homepage = parsed2.personal_homepage or final2
+                parsed2.profile_url = rec.profile_url
+                parsed2.extraction_method = (
+                    f"{parsed2.extraction_method}+secondary_profile"
+                    if parsed2.extraction_method else "secondary_profile"
+                )
+                return parsed2, None
+
+            # Render secondary if HTTP was incomplete.
+            parsed2, html2b, final2b = await try_parse(second_url, True)
+            if parsed2:
+                parsed2.personal_homepage = parsed2.personal_homepage or final2b
+                parsed2.profile_url = rec.profile_url
+                parsed2.extraction_method = (
+                    f"{parsed2.extraction_method}+secondary_rendered_profile"
+                    if parsed2.extraction_method else "secondary_rendered_profile"
+                )
+                return parsed2, None
+
         return None, {
-            'type': 'profile_fetch_failed',
-            'source_url': rec.source_url,
-            'profile_url': rec.profile_url,
-            'name': rec.name,
-            'error': excel_safe(last_error),
+            "type": "profile_no_verified_email",
+            "source_url": rec.source_url,
+            "profile_url": rec.profile_url,
+            "name": rec.name,
+            "secondary_profiles_tried": secondary_urls,
+            "last_error": excel_safe(last_error),
         }
 
 
