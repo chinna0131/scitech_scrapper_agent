@@ -25,9 +25,9 @@ except Exception:
 # CONFIG
 # =============================================================================
 
-EMPLOYEE_NAME = "Lakshanya"
-EMPLOYEE_EMAIL = "lakshanyam99@gmail.com"
-FILE_NAME = "Lakshanya_DERMATOLOGY_University_DATA_02-09-2026"
+EMPLOYEE_NAME = "Thriveni"
+EMPLOYEE_EMAIL = "dyavanapallythriveni2002@gmail.com"
+FILE_NAME = "Thriveni_Nano_University_DATA_02-09-2026"
 INPUT_FILE = Path("urls.xlsx")
 
 USE_LLM = True
@@ -10293,6 +10293,1458 @@ async def scrape_source(
         })
 
     return records
+
+
+# =============================================================================
+# V20 INTEGRATED ROBUST CLEANER
+# =============================================================================
+#
+# This final stage runs automatically inside THIS scraper.
+# You do NOT need to run a second cleaning script.
+#
+# Pipeline:
+#   scrape all URLs
+#       -> robust email validation/repair
+#       -> robust name cleanup
+#       -> replace bad/wrong/empty names from email when evidence is strong
+#       -> profile-URL fallback when email username is compact
+#       -> compact-email fallback when no safer name exists
+#       -> country cleanup
+#       -> alternate-email contamination cleanup
+#       -> smart dedupe
+#       -> write Scraped Data + Cleaning Audit + Rejected Rows
+#
+# Important identity rules:
+#   * email is mandatory
+#   * name/country are optional
+#   * personal firstname.lastname-style emails can repair a wrong name
+#   * compact usernames are used only as a weak last-resort display name
+#   * generic/shared mailboxes NEVER manufacture a person name
+#   * shared mailbox + real person mappings are preserved independently
+# =============================================================================
+
+from copy import deepcopy
+
+V20_WRITE_AUDIT_SHEETS = True
+V20_REPAIR_EMAIL_ARTIFACTS = True
+V20_REPLACE_WRONG_NAMES_FROM_EMAIL = True
+V20_NAME_FROM_EMAIL_IF_BAD_OR_EMPTY = True
+V20_PRESERVE_SHARED_EMAIL_PER_PERSON = True
+V20_MAX_ALTERNATE_EMAILS = 3
+
+V20_EMAIL_FULL_RE = re.compile(
+    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$",
+    re.I,
+)
+
+V20_ARTIFACT_TLDS = {
+    "turn", "human", "results", "result", "page", "pages", "html", "text",
+    "example", "invalid", "test", "none", "null", "undefined", "here",
+    "click", "below", "find", "going", "however", "profiles", "foroughi",
+    "bathina", "priors", "engineering", "visit", "with", "from", "this",
+    "that", "where", "when", "you", "my", "his", "her", "she", "we", "for",
+}
+
+V20_FAKE_EXACT_EMAILS = {
+    "or@all.turn",
+    "study@midgestation.human",
+    "also@delivery.results",
+    "analyst@musc.his",
+    "person@email.cz",
+    "bluesky@bsky.social",
+}
+
+V20_GENERIC_LOCAL_ROOTS = {
+    "info", "contact", "contacts", "office", "admin", "administrator",
+    "webmaster", "support", "help", "reception", "secretary", "faculty",
+    "staff", "team", "department", "dept", "editor", "editorial",
+    "enquiries", "inquiries", "communications", "communication", "media",
+    "press", "admissions", "admission", "student", "students", "website",
+    "research", "researchteam", "clinic", "lab", "laboratory", "hr",
+    "jobs", "careers", "leadership", "postbac", "dlag", "all",
+    "general", "hello", "submission", "submissions", "journal",
+}
+
+V20_GENERIC_LOCAL_SUBSTRINGS = {
+    "webmaster", "contact", "support", "admin", "faculty", "staff",
+    "department", "editorial", "secretary", "reception", "admission",
+    "studentoffice", "media", "communications",
+}
+
+V20_BAD_NAME_EXACT = {
+    "", "telephone", "phone", "email", "e-mail", "contact", "contact us",
+    "faculty", "staff", "team", "research team", "leadership",
+    "administrative leadership", "view profile", "view full profile",
+    "profile", "read more", "learn more", "home", "website", "location",
+    "follow us", "follow us on bluesky", "bluesky", "researchers",
+    "professional staff", "academic staff", "academic visitors",
+    "administrative staff", "admissions information", "about us",
+    "about the group", "group leaders", "our people", "our team",
+    "student support", "student wellbeing", "current students",
+    "members", "directory", "people",
+}
+
+V20_BAD_NAME_PHRASES = {
+    "skip to", "click here", "learn more", "read more", "view profile",
+    "view full profile", "contact us", "find a doctor", "find a researcher",
+    "for more information", "for all media inquiries",
+    "employment opportunities", "javascript isn't enabled",
+    "javascript is not enabled", "submit applications",
+    "learn more about this group", "track attendance",
+    "by visiting the", "or visiting the", "or dr.", "or dr ",
+    "and dr.", "and dr ", "federally funded website",
+    "application information", "seminar:",
+}
+
+V20_ADDRESS_WORDS = {
+    "road", "rd", "street", "st", "avenue", "ave", "boulevard", "blvd",
+    "lane", "ln", "drive", "highway", "hwy", "box", "suite", "unit",
+    "building", "floor", "room", "campus", "postcode", "zip",
+}
+
+V20_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:professor|prof|dr|doctor|doc|mudr|mr|mrs|miss|ms)\.?\s+)+",
+    re.I,
+)
+
+V20_CREDENTIALS = (
+    r"(?:MD|M\.D\.|PhD|Ph\.D\.|DO|D\.O\.|PsyD|EdD|JD|MPH|MHA|MPA|MBA|"
+    r"MSW|MEd|MSc|MS|MA|BSc|BA|MBBS|MBChB|BMedSci|ChB|MRCP|MRCPCH|"
+    r"FRCPCH|CSc|ScD|DDS|DMD|RN|PharmD|FACOG|FACS|FAPA|FRCP|FRCS)"
+)
+
+V20_ROLE_SUFFIX_RE = re.compile(
+    r"\b(?:"
+    r"Emeritus Professor(?:\s+of\b.*)?|"
+    r"Associate Professor(?:\s+(?:in|of)\b.*)?|"
+    r"Assistant Professor(?:\s+(?:in|of)\b.*)?|"
+    r"Professor(?:\s+(?:in|of)\b.*)?|"
+    r"Reader(?:\s+in\b.*)?|Senior Lecturer(?:\s+in\b.*)?|"
+    r"Lecturer(?:\s+in\b.*)?|Honorary Senior Research Fellow|"
+    r"Honorary Research Fellow|Honorary Senior Lecturer|Honorary Lecturer|"
+    r"Senior Research Fellow|Research Fellow|Advanced Research Fellow|"
+    r"Senior Research Associate|Research Associate|Postdoctoral Researcher|"
+    r"Postdoctoral Research Fellow|Postdoc|PhD Student|Doctoral Researcher|"
+    r"Senior Transport Analyst|Transport Analyst|Teaching Fellow|"
+    r"Senior Teaching Fellow|Academic Visitor|Director\b.*|Manager\b.*|"
+    r"Coordinator\b.*|Administrator\b.*|Technician\b.*|Scientist\b.*"
+    r")$",
+    re.I,
+)
+
+V20_ACADEMIC_SUFFIXES = [
+    ".ac.uk", ".edu.au", ".edu", ".ac.in", ".edu.sg", ".ac.jp", ".ac.kr",
+    ".edu.cn", ".ac.cn", ".edu.hk", ".ac.nz", ".edu.my", ".ac.za",
+    ".gov.uk", ".gov.au", ".gov",
+]
+
+V20_TLD_COUNTRY = {
+    "au": "Australia", "at": "Austria", "bd": "Bangladesh", "be": "Belgium",
+    "br": "Brazil", "ca": "Canada", "ch": "Switzerland", "cn": "China",
+    "cz": "Czech Republic", "de": "Germany", "dk": "Denmark", "eg": "Egypt",
+    "es": "Spain", "et": "Ethiopia", "fi": "Finland", "fr": "France",
+    "gr": "Greece", "hk": "Hong Kong", "id": "Indonesia", "ie": "Ireland",
+    "il": "Israel", "in": "India", "ir": "Iran", "it": "Italy",
+    "jp": "Japan", "ke": "Kenya", "kr": "South Korea", "lb": "Lebanon",
+    "lk": "Sri Lanka", "lv": "Latvia", "mt": "Malta", "my": "Malaysia",
+    "ng": "Nigeria", "nl": "Netherlands", "no": "Norway", "np": "Nepal",
+    "nz": "New Zealand", "ph": "Philippines", "pk": "Pakistan",
+    "pl": "Poland", "pt": "Portugal", "sa": "Saudi Arabia",
+    "se": "Sweden", "sg": "Singapore", "th": "Thailand",
+    "tn": "Tunisia", "tr": "Turkey", "tw": "Taiwan", "ug": "Uganda",
+    "uk": "United Kingdom", "us": "United States", "za": "South Africa",
+}
+
+
+def _v20_ascii(value: str) -> str:
+    return (
+        unicodedata.normalize("NFKD", clean_text(value))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+
+
+def _v20_host(url: str) -> str:
+    try:
+        return urlparse(clean_text(url)).netloc.casefold().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def _v20_append_method(existing: str, marker: str) -> str:
+    parts = [x for x in clean_text(existing).split("+") if x]
+    if marker not in parts:
+        parts.append(marker)
+    return "+".join(parts)
+
+
+def _v20_decode_obfuscated_email(value: str) -> str:
+    value = clean_text(value)
+    if not value:
+        return ""
+
+    value = unquote(value)
+    value = re.sub(r"(?i)^mailto:", "", value).strip()
+    value = re.sub(r"(?i)\s*\[\s*at\s*\]\s*", "@", value)
+    value = re.sub(r"(?i)\s*\(\s*at\s*\)\s*", "@", value)
+    value = re.sub(r"(?i)\s+at\s+", "@", value)
+    value = re.sub(r"(?i)\s*\[\s*dot\s*\]\s*", ".", value)
+    value = re.sub(r"(?i)\s*\(\s*dot\s*\)\s*", ".", value)
+    value = re.sub(r"(?i)\s+dot\s+", ".", value)
+    value = re.sub(r"\s*@\s*", "@", value)
+    value = re.sub(r"\s*\.\s*", ".", value)
+    return value.strip()
+
+
+def _v20_normalize_email(value: str) -> str:
+    value = _v20_decode_obfuscated_email(value).casefold()
+    if not value:
+        return ""
+
+    m = re.search(
+        r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,32}",
+        value,
+        re.I,
+    )
+    if not m:
+        return ""
+
+    return m.group(0).strip(" <>[](){};,:'\"./")
+
+
+def _v20_repair_email_artifact(
+    email: str,
+    source_url: str = "",
+    profile_url: str = "",
+) -> Tuple[str, bool]:
+    email = _v20_normalize_email(email)
+    if "@" not in email:
+        return email, False
+
+    local, domain = email.rsplit("@", 1)
+    domain = domain.casefold()
+
+    # Known institutional public suffix followed by one accidental word.
+    for suffix in V20_ACADEMIC_SUFFIXES:
+        marker = suffix + "."
+        pos = domain.find(marker)
+        if pos >= 0:
+            candidate_domain = domain[:pos + len(suffix)]
+            trailing = domain[pos + len(marker):]
+            if trailing and re.fullmatch(r"[a-z]{2,24}", trailing):
+                return f"{local}@{candidate_domain}", True
+
+    # Source/profile host can prove an embedded real host.
+    for host in (_v20_host(source_url), _v20_host(profile_url)):
+        if not host or "." not in host:
+            continue
+        if domain == host:
+            return email, False
+        if domain.startswith(host + "."):
+            trailing = domain[len(host) + 1:]
+            if re.fullmatch(r"[a-z]{2,24}", trailing):
+                return f"{local}@{host}", True
+
+    return email, False
+
+
+def _v20_valid_email(email: str) -> bool:
+    email = _v20_normalize_email(email)
+    if not email or email in V20_FAKE_EXACT_EMAILS:
+        return False
+
+    if not V20_EMAIL_FULL_RE.fullmatch(email):
+        return False
+
+    if email.count("@") != 1 or ".." in email:
+        return False
+
+    local, domain = email.rsplit("@", 1)
+    if not local or not domain or "." not in domain:
+        return False
+
+    labels = domain.split(".")
+    if any(
+        not label or label.startswith("-") or label.endswith("-")
+        for label in labels
+    ):
+        return False
+
+    tld = labels[-1].casefold()
+    if tld in V20_ARTIFACT_TLDS:
+        return False
+
+    if domain in {
+        "all.turn",
+        "midgestation.human",
+        "delivery.results",
+        "risk.support",
+    }:
+        return False
+
+    # Reuse installed email_validator when present.
+    try:
+        if _validate_email_address is not None:
+            _validate_email_address(email, check_deliverability=False)
+    except Exception:
+        return False
+
+    return True
+
+
+def _v20_normalize_and_validate_email(
+    value: str,
+    source_url: str = "",
+    profile_url: str = "",
+) -> Tuple[str, bool, str]:
+    email = _v20_normalize_email(value)
+    if not email:
+        return "", False, "invalid_email"
+
+    repaired, changed = _v20_repair_email_artifact(
+        email,
+        source_url,
+        profile_url,
+    )
+
+    if _v20_valid_email(repaired):
+        return repaired, changed, ""
+
+    if repaired != email and _v20_valid_email(email):
+        return email, False, ""
+
+    return "", changed, "invalid_email"
+
+
+def _v20_is_shared_email(email: str) -> bool:
+    email = _v20_normalize_email(email)
+    if "@" not in email:
+        return False
+
+    local = email.split("@", 1)[0].casefold()
+    root = re.split(r"[._+\-]", local)[0]
+
+    if local in V20_GENERIC_LOCAL_ROOTS or root in V20_GENERIC_LOCAL_ROOTS:
+        return True
+
+    return any(token in local for token in V20_GENERIC_LOCAL_SUBSTRINGS)
+
+
+def _v20_email_parts(email: str) -> List[str]:
+    email = _v20_normalize_email(email)
+    if "@" not in email:
+        return []
+
+    local = email.split("@", 1)[0].split("+", 1)[0].casefold()
+    parts = []
+
+    for token in re.split(r"[._\-]+", local):
+        token = re.sub(r"\d+$", "", token)
+        token = "".join(
+            ch for ch in token
+            if unicodedata.category(ch).startswith("L")
+        )
+        if token:
+            parts.append(token)
+
+    return parts
+
+
+def _v20_pretty_token(token: str) -> str:
+    if not token:
+        return ""
+    if len(token) == 1:
+        return token.upper() + "."
+    return token[:1].upper() + token[1:].lower()
+
+
+def _v20_strong_name_from_email(email: str) -> str:
+    """
+    Strong evidence requires explicit local-part boundaries.
+
+      john.smith@x.edu -> John Smith
+      j.smith@x.edu    -> J. Smith
+      maria.apud-bell  -> Maria Apud Bell
+    """
+    if _v20_is_shared_email(email):
+        return ""
+
+    parts = _v20_email_parts(email)
+    if len(parts) < 2:
+        return ""
+
+    meaningful = [x for x in parts if len(x) >= 2]
+    if not meaningful:
+        return ""
+
+    return " ".join(_v20_pretty_token(x) for x in parts)
+
+
+def _v20_weak_name_from_email(email: str) -> str:
+    """
+    Last-resort display name for compact personal usernames.
+
+    Example:
+      szhao@uga.edu -> Szhao
+
+    We deliberately DO NOT pretend that Szhao == "S Zhao" because there is no
+    reliable separator. The audit records this as a weak derivation.
+    """
+    if _v20_is_shared_email(email):
+        return ""
+
+    strong = _v20_strong_name_from_email(email)
+    if strong:
+        return strong
+
+    local = _v20_normalize_email(email).split("@", 1)[0].split("+", 1)[0]
+    local = re.sub(r"\d+$", "", local)
+    local = "".join(
+        ch for ch in local
+        if unicodedata.category(ch).startswith("L")
+    )
+
+    if len(local) < 3:
+        return ""
+
+    return _v20_pretty_token(local)
+
+
+def _v20_remove_credentials(name: str) -> str:
+    name = clean_text(name)
+    for _ in range(8):
+        old = name
+        name = re.sub(
+            rf"(?:[,\s]+{V20_CREDENTIALS}\.?)\s*$",
+            "",
+            name,
+            flags=re.I,
+        )
+        name = re.sub(
+            r"\s*\((?:Hons|Honours)\)\s*$",
+            "",
+            name,
+            flags=re.I,
+        )
+        name = name.strip(" ,;-")
+        if name == old:
+            break
+    return clean_text(name)
+
+
+def _v20_clean_initials(name: str) -> str:
+    return re.sub(r"(?<=[A-Za-z])\.(?=[A-Za-z])", ". ", name)
+
+
+def _v20_convert_surname_first(name: str) -> str:
+    if "," not in name:
+        return name
+
+    left, right = name.split(",", 1)
+    left = clean_text(left)
+    right = clean_text(right)
+
+    if not left or not right:
+        return left or right
+
+    if len(left.split()) > 3 or len(right.split()) > 5:
+        return name
+
+    right = V20_PREFIX_RE.sub("", right)
+    right = _v20_remove_credentials(right)
+    right = _v20_clean_initials(right)
+
+    if not right:
+        return left
+
+    return f"{right} {left}"
+
+
+def _v20_strip_role_suffix(name: str) -> str:
+    name = clean_text(name)
+    if not name:
+        return ""
+
+    m = V20_ROLE_SUFFIX_RE.search(name)
+    if not m:
+        return name
+
+    head = name[:m.start()].strip(" ,;-")
+    if len(_v20_name_tokens(head)) >= 2:
+        return head
+
+    return name
+
+
+def _v20_clean_name(name: str) -> str:
+    name = clean_text(name)
+    if not name:
+        return ""
+
+    name = re.sub(r"^\s*profile\s+of\s+", "", name, flags=re.I)
+    name = V20_PREFIX_RE.sub("", name)
+    name = _v20_convert_surname_first(name)
+    name = V20_PREFIX_RE.sub("", name)
+    name = _v20_remove_credentials(name)
+    name = _v20_clean_initials(name)
+    name = _v20_strip_role_suffix(name)
+    name = re.sub(r"\s+", " ", name)
+
+    return name.strip(" ,;-|()")
+
+
+def _v20_name_tokens(name: str) -> List[str]:
+    value = _v20_ascii(name)
+
+    ignore = {
+        "dr", "doctor", "prof", "professor", "mr", "mrs", "miss", "ms",
+        "md", "phd", "do", "jd", "associate", "assistant", "senior",
+        "honorary", "research", "fellow", "lecturer", "reader",
+    }
+
+    return [
+        x for x in re.findall(r"[a-z]+", value)
+        if len(x) >= 2 and x not in ignore
+    ]
+
+
+def _v20_looks_like_address(name: str) -> bool:
+    n = clean_text(name)
+    low = _v20_ascii(n)
+
+    if re.match(r"^\d{2,}\b", n):
+        return True
+
+    tokens = set(re.findall(r"[a-z]+", low))
+    if len(tokens & V20_ADDRESS_WORDS) >= 2:
+        return True
+
+    return bool(re.search(r"\b(?:po box|p\.o\. box|postcode|zip)\b", low))
+
+
+def _v20_bad_name(name: str) -> bool:
+    name = _v20_clean_name(name)
+    if not name:
+        return True
+
+    low = _v20_ascii(name).strip(" :;,.|-")
+
+    if low in V20_BAD_NAME_EXACT:
+        return True
+
+    if any(phrase in low for phrase in V20_BAD_NAME_PHRASES):
+        return True
+
+    if "@" in name or "://" in name:
+        return True
+
+    if len(name) > 100:
+        return True
+
+    if name.startswith((")", "(", ",", ";", ":", "-", "–", "—")):
+        return True
+
+    if name.endswith(("(", ")", ":", ";")):
+        return True
+
+    if re.fullmatch(r"[\W\d_]+", name):
+        return True
+
+    words = name.split()
+    if len(words) > 9:
+        return True
+
+    if len(words) >= 5 and re.search(
+        r"\b(?:the|and|or|by|for|from|with|visiting|application|information|"
+        r"website|seminar|progress|research|contacting|attendees)\b",
+        low,
+    ):
+        return True
+
+    if re.search(r"\b(?:19|20)\d{2}\b", name) and len(words) > 3:
+        return True
+
+    if _v20_looks_like_address(name):
+        return True
+
+    org_words = {
+        "university", "hospital", "department", "faculty", "school", "college",
+        "institute", "center", "centre", "clinic", "laboratory", "office",
+        "committee", "team", "group", "program", "programme",
+    }
+    if any(word in low for word in org_words) and len(words) <= 7:
+        return True
+
+    return not bool(_v20_name_tokens(name))
+
+
+def _v20_name_from_profile_url(profile_url: str) -> str:
+    url = clean_text(profile_url)
+    if not url:
+        return ""
+
+    try:
+        segments = [
+            unquote(x)
+            for x in urlparse(url).path.split("/")
+            if x
+        ]
+    except Exception:
+        return ""
+
+    for seg in reversed(segments[-3:]):
+        seg = re.sub(r"\.(?:html?|php|aspx?)$", "", seg, flags=re.I)
+        if not seg or seg.isdigit() or len(seg) > 80:
+            continue
+
+        if re.search(r"[-._]", seg):
+            parts = [
+                x for x in re.split(r"[-._]+", seg)
+                if x and not x.isdigit()
+            ]
+            if 2 <= len(parts) <= 6:
+                candidate = " ".join(_v20_pretty_token(x) for x in parts)
+                if not _v20_bad_name(candidate):
+                    return candidate
+
+    return ""
+
+
+def _v20_email_name_tokens(email: str) -> List[str]:
+    return _v20_name_tokens(_v20_strong_name_from_email(email))
+
+
+def _v20_name_matches_email(name: str, email: str) -> Optional[bool]:
+    nt = _v20_name_tokens(name)
+    et = _v20_email_name_tokens(email)
+
+    if not nt or not et:
+        return None
+
+    if set(nt) & set(et):
+        return True
+
+    if nt[-1] == et[-1]:
+        return True
+
+    return False
+
+
+def _v20_profile_supports_email_name(profile_name: str, email_name: str) -> bool:
+    pt = set(_v20_name_tokens(profile_name))
+    et = set(_v20_name_tokens(email_name))
+    return bool(pt and et and (pt & et))
+
+
+def _v20_choose_name(
+    original_name: str,
+    email: str,
+    profile_url: str = "",
+) -> Tuple[str, str, bool, str]:
+    """
+    Priority for wrong/empty names:
+      1) strong firstname.lastname-style email name
+      2) person-like profile URL name
+      3) compact email username as weak display fallback
+      4) blank for shared/role mailboxes
+    """
+    original_clean = _v20_clean_name(original_name)
+    bad = _v20_bad_name(original_clean)
+
+    strong_email = _v20_strong_name_from_email(email)
+    profile_name = _v20_name_from_profile_url(profile_url)
+    weak_email = _v20_weak_name_from_email(email)
+
+    # Shared mailboxes are valid but do not manufacture a person identity.
+    if _v20_is_shared_email(email):
+        if original_clean and not bad:
+            return (
+                original_clean,
+                "source_name",
+                original_clean != clean_text(original_name),
+                "shared_email_keep_valid_source_name",
+            )
+        return (
+            "",
+            "shared_email_no_person_name",
+            bool(clean_text(original_name)),
+            "shared_email_bad_or_missing_name",
+        )
+
+    # Bad or missing source name.
+    if bad:
+        if strong_email:
+            return (
+                strong_email,
+                "email_strong",
+                True,
+                "bad_or_empty_name_replaced_from_email",
+            )
+
+        if profile_name:
+            return (
+                profile_name,
+                "profile_url",
+                True,
+                "bad_or_empty_name_replaced_from_profile_url",
+            )
+
+        if weak_email:
+            return (
+                weak_email,
+                "email_local_weak",
+                True,
+                "bad_or_empty_name_replaced_from_compact_email",
+            )
+
+        return (
+            "",
+            "blank",
+            bool(clean_text(original_name)),
+            "bad_name_no_safe_replacement",
+        )
+
+    # Plausible source name but strong email contradicts it.
+    if V20_REPLACE_WRONG_NAMES_FROM_EMAIL and strong_email:
+        match = _v20_name_matches_email(original_clean, email)
+
+        if match is False:
+            if (
+                profile_name
+                and _v20_profile_supports_email_name(profile_name, strong_email)
+            ):
+                return (
+                    strong_email,
+                    "email_strong+profile_support",
+                    True,
+                    "name_email_mismatch_profile_supports_email",
+                )
+
+            et = _v20_email_name_tokens(email)
+            if len(et) >= 2:
+                return (
+                    strong_email,
+                    "email_strong",
+                    True,
+                    "name_email_strong_mismatch",
+                )
+
+    return (
+        original_clean,
+        "source_name",
+        original_clean != clean_text(original_name),
+        "kept_source_name",
+    )
+
+
+def _v20_country_from_email(email: str) -> str:
+    email = _v20_normalize_email(email)
+    if "@" not in email:
+        return ""
+
+    tld = email.rsplit(".", 1)[-1].casefold()
+    return V20_TLD_COUNTRY.get(tld, "")
+
+
+def _v20_country_from_source(source_url: str) -> str:
+    host = _v20_host(source_url)
+    if not host or "." not in host:
+        return ""
+
+    tld = host.rsplit(".", 1)[-1].casefold()
+    return V20_TLD_COUNTRY.get(tld, "")
+
+
+def _v20_clean_country(
+    existing_country: str,
+    email: str,
+    source_url: str,
+) -> Tuple[str, str]:
+    existing = normalize_country(existing_country)
+    if existing:
+        return existing, "existing_clean"
+
+    c = _v20_country_from_email(email)
+    if c:
+        return c, "email_tld_cleaning"
+
+    c = _v20_country_from_source(source_url)
+    if c:
+        return c, "source_tld_cleaning"
+
+    return "", ""
+
+
+def _v20_split_email_values(value: str) -> List[str]:
+    value = clean_text(value)
+    if not value:
+        return []
+
+    return re.findall(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+        r"[A-Za-z0-9.-]+\.[A-Za-z]{2,32}",
+        value,
+    )
+
+
+def _v20_clean_alternates(
+    value: str,
+    primary_email: str,
+    source_url: str = "",
+    profile_url: str = "",
+    email_conflict: str = "no",
+) -> str:
+    primary = _v20_normalize_email(primary_email)
+    output = []
+    seen = set()
+
+    for raw in _v20_split_email_values(value):
+        email, _, reason = _v20_normalize_and_validate_email(
+            raw,
+            source_url,
+            profile_url,
+        )
+        if reason or not email or email == primary or email in seen:
+            continue
+
+        seen.add(email)
+        output.append(email)
+
+    if not output:
+        return ""
+
+    # Remove broad-page alternate contamination.
+    if len(output) > V20_MAX_ALTERNATE_EMAILS:
+        return ""
+
+    if str(email_conflict or "").casefold() != "yes" and len(output) > 1:
+        return ""
+
+    return " | ".join(output)
+
+
+def _v20_record_quality(rec: PersonRecord) -> int:
+    score = 0
+
+    if clean_text(rec.name):
+        score += 30
+    if clean_text(rec.profile_url):
+        score += 30
+    if clean_text(rec.affiliation):
+        score += 10
+    if clean_text(rec.academic_title):
+        score += 10
+    if clean_text(rec.country):
+        score += 5
+    if rec.email_type == "personal":
+        score += 10
+
+    method = clean_text(rec.extraction_method).casefold()
+    if "profile" in method:
+        score += 20
+    if "mailto" in method:
+        score += 8
+    if "page_text" in method:
+        score -= 10
+    if "fallback" in method:
+        score -= 5
+
+    try:
+        score += min(15, int(float(rec.confidence or 0) / 10))
+    except Exception:
+        pass
+
+    return score
+
+
+V20_MERGE_FIELDS = [
+    "country", "academic_title", "academic_rank", "specialty", "affiliation",
+    "university", "faculty", "school", "department", "institute", "division",
+    "city", "address", "phone", "orcid", "google_scholar", "scopus_author_id",
+    "researcher_id", "pubmed", "profile_url", "personal_homepage",
+    "country_source",
+]
+
+
+def _v20_merge_records(a: PersonRecord, b: PersonRecord) -> PersonRecord:
+    best, other = (
+        (a, b)
+        if _v20_record_quality(a) >= _v20_record_quality(b)
+        else (b, a)
+    )
+
+    result = deepcopy(best)
+
+    for field_name in V20_MERGE_FIELDS:
+        if not clean_text(getattr(result, field_name, "")):
+            new = getattr(other, field_name, "")
+            if clean_text(new):
+                setattr(result, field_name, new)
+
+    try:
+        result.confidence = max(
+            int(float(a.confidence or 0)),
+            int(float(b.confidence or 0)),
+        )
+    except Exception:
+        pass
+
+    methods = []
+    for method in (
+        clean_text(a.extraction_method),
+        clean_text(b.extraction_method),
+    ):
+        for part in method.split("+"):
+            if part and part not in methods:
+                methods.append(part)
+
+    result.extraction_method = "+".join(methods)
+    return result
+
+
+def _v20_clean_one_record(
+    rec: PersonRecord,
+    sequence_no: int,
+) -> Tuple[Optional[PersonRecord], Dict]:
+    rec = deepcopy(rec)
+
+    audit = {
+        "record_no": sequence_no,
+        "old_name": clean_text(rec.name),
+        "old_email": clean_text(rec.email),
+        "new_name": "",
+        "new_email": "",
+        "name_action": "",
+        "email_action": "",
+        "reason": "",
+        "source_url": clean_text(rec.source_url),
+        "profile_url": clean_text(rec.profile_url),
+    }
+
+    email, repaired, email_reason = _v20_normalize_and_validate_email(
+        rec.email,
+        rec.source_url,
+        rec.profile_url,
+    )
+
+    if email_reason or not email:
+        audit["reason"] = email_reason or "invalid_email"
+        return None, audit
+
+    rec.email = email
+    audit["new_email"] = email
+    audit["email_action"] = (
+        "repaired_domain_artifact"
+        if repaired
+        else "normalized"
+    )
+
+    new_name, name_source, changed, reason = _v20_choose_name(
+        rec.name,
+        email,
+        rec.profile_url,
+    )
+
+    rec.name = new_name
+    audit["new_name"] = new_name
+    audit["name_action"] = name_source
+    audit["reason"] = reason
+
+    if changed:
+        marker_map = {
+            "email_strong": "cleaned_name_from_email_strong",
+            "email_strong+profile_support": "cleaned_name_from_email_strong",
+            "email_local_weak": "cleaned_name_from_email_weak",
+            "profile_url": "cleaned_name_from_profile_url",
+            "shared_email_no_person_name": "cleaned_shared_email_name_removed",
+        }
+        rec.extraction_method = _v20_append_method(
+            rec.extraction_method,
+            marker_map.get(name_source, "cleaned_name"),
+        )
+
+    if repaired:
+        rec.extraction_method = _v20_append_method(
+            rec.extraction_method,
+            "repaired_email_domain_artifact",
+        )
+
+    rec.email_type = (
+        "shared/role"
+        if _v20_is_shared_email(email)
+        else "personal"
+    )
+
+    rec.alternate_emails = _v20_clean_alternates(
+        rec.alternate_emails,
+        email,
+        rec.source_url,
+        rec.profile_url,
+        rec.email_conflict,
+    )
+    rec.email_conflict = "yes" if rec.alternate_emails else "no"
+
+    country, country_source = _v20_clean_country(
+        rec.country,
+        email,
+        rec.source_url,
+    )
+    rec.country = country
+
+    if country_source and (
+        not clean_text(rec.country_source)
+        or country_source != "existing_clean"
+    ):
+        rec.country_source = country_source
+
+    for field_name in (
+        "journal_name", "editorial_role", "academic_title", "academic_rank",
+        "specialty", "affiliation", "university", "faculty", "school",
+        "department", "institute", "division", "city", "address",
+    ):
+        setattr(
+            rec,
+            field_name,
+            clean_text(getattr(rec, field_name, "")),
+        )
+
+    rec.phone = clean_text(rec.phone)[:150]
+
+    for field_name in (
+        "orcid", "google_scholar", "scopus_author_id", "researcher_id",
+        "pubmed", "profile_url", "personal_homepage", "source_url",
+    ):
+        value = clean_text(getattr(rec, field_name, ""))
+        if value.casefold() in {"none", "null", "n/a", "na", "-"}:
+            value = ""
+        setattr(rec, field_name, value)
+
+    try:
+        conf = int(float(rec.confidence or 0))
+    except Exception:
+        conf = 0
+
+    if name_source == "email_local_weak":
+        rec.confidence = min(conf or 70, 70)
+    elif name_source == "shared_email_no_person_name":
+        rec.confidence = min(conf or 65, 65)
+
+    rec.scrape_status = "accepted"
+    return rec, audit
+
+
+def _v20_dedupe_clean_records(
+    records: List[PersonRecord],
+) -> Tuple[List[PersonRecord], int]:
+    """
+    Personal mailbox:
+      one merged record per email.
+
+    Shared mailbox:
+      preserve distinct person/profile mappings.
+    """
+    merged: Dict[Tuple, PersonRecord] = {}
+    duplicate_count = 0
+
+    for rec in records:
+        email = _v20_normalize_email(rec.email)
+        name_key = " ".join(_v20_name_tokens(rec.name))
+        profile = normalize_url(rec.profile_url).casefold()
+
+        if (
+            _v20_is_shared_email(email)
+            and V20_PRESERVE_SHARED_EMAIL_PER_PERSON
+        ):
+            if name_key:
+                key = ("shared_person", email, name_key)
+            elif profile:
+                key = ("shared_profile", email, profile)
+            else:
+                key = ("shared_email", email)
+        else:
+            key = ("personal_email", email)
+
+        if key not in merged:
+            merged[key] = rec
+        else:
+            duplicate_count += 1
+            merged[key] = _v20_merge_records(
+                merged[key],
+                rec,
+            )
+
+    return list(merged.values()), duplicate_count
+
+
+def clean_records_v20(
+    records: List[PersonRecord],
+) -> Tuple[List[PersonRecord], List[Dict], List[Dict], Dict]:
+    cleaned = []
+    audits = []
+    rejected = []
+
+    stats = {
+        "original_rows": len(records),
+        "invalid_removed": 0,
+        "email_artifacts_repaired": 0,
+        "strong_email_names": 0,
+        "weak_email_names": 0,
+        "profile_url_names": 0,
+        "shared_names_removed": 0,
+        "duplicate_observations_merged": 0,
+        "final_rows": 0,
+        "unique_emails": 0,
+        "blank_names": 0,
+        "shared_role_rows": 0,
+    }
+
+    for idx, rec in enumerate(records, start=1):
+        cleaned_rec, audit = _v20_clean_one_record(rec, idx)
+        audits.append(audit)
+
+        if cleaned_rec is None:
+            stats["invalid_removed"] += 1
+            rejected.append({
+                "record_no": idx,
+                "name": audit.get("old_name", ""),
+                "email": audit.get("old_email", ""),
+                "reason": audit.get("reason", "invalid_email"),
+                "source_url": audit.get("source_url", ""),
+                "profile_url": audit.get("profile_url", ""),
+            })
+            continue
+
+        if audit.get("email_action") == "repaired_domain_artifact":
+            stats["email_artifacts_repaired"] += 1
+
+        action = audit.get("name_action", "")
+        if action.startswith("email_strong"):
+            stats["strong_email_names"] += 1
+        elif action == "email_local_weak":
+            stats["weak_email_names"] += 1
+        elif action == "profile_url":
+            stats["profile_url_names"] += 1
+        elif action == "shared_email_no_person_name":
+            stats["shared_names_removed"] += 1
+
+        if cleaned_rec.email_type == "shared/role":
+            stats["shared_role_rows"] += 1
+
+        cleaned.append(cleaned_rec)
+
+    cleaned, duplicate_count = _v20_dedupe_clean_records(cleaned)
+    stats["duplicate_observations_merged"] = duplicate_count
+
+    cleaned.sort(
+        key=lambda r: (
+            clean_text(r.page_type).casefold(),
+            clean_text(r.journal_name).casefold(),
+            clean_text(r.country).casefold(),
+            clean_text(r.name).casefold(),
+            clean_text(r.email).casefold(),
+        )
+    )
+
+    stats["final_rows"] = len(cleaned)
+    stats["unique_emails"] = len({
+        _v20_normalize_email(r.email)
+        for r in cleaned
+        if _v20_normalize_email(r.email)
+    })
+    stats["blank_names"] = sum(
+        1 for r in cleaned
+        if not clean_text(r.name)
+    )
+
+    return cleaned, audits, rejected, stats
+
+
+def _v20_style_sheet(ws):
+    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    font = Font(bold=True, color="FFFFFF")
+
+    for cell in ws[1]:
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+def save_excel_v20(
+    records: List[PersonRecord],
+    audits: Optional[List[Dict]] = None,
+    rejected: Optional[List[Dict]] = None,
+    stats: Optional[Dict] = None,
+):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Scraped Data"
+
+    ws.append([excel_safe(c) for c in COLUMNS])
+
+    for rec in records:
+        data = asdict(rec)
+        ws.append([
+            excel_safe(data.get(c, ""))
+            for c in COLUMNS
+        ])
+
+    _v20_style_sheet(ws)
+
+    widths = {
+        "A": 42, "B": 42, "C": 22, "D": 55, "E": 18, "F": 14,
+        "G": 18, "H": 38, "I": 24, "J": 48, "K": 32, "L": 32,
+        "M": 26, "N": 28, "O": 75, "P": 50, "Q": 45, "R": 45,
+        "S": 50, "T": 50, "U": 42, "V": 24, "W": 65, "X": 24,
+        "Y": 65, "Z": 65, "AA": 24, "AB": 24, "AC": 65,
+        "AD": 65, "AE": 85, "AF": 25, "AG": 14, "AH": 75,
+        "AI": 20, "AJ": 20,
+    }
+
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    if V20_WRITE_AUDIT_SHEETS:
+        audit_ws = wb.create_sheet("Cleaning Audit")
+        audit_headers = [
+            "record_no", "old_name", "old_email", "new_name", "new_email",
+            "name_action", "email_action", "reason",
+            "source_url", "profile_url",
+        ]
+        audit_ws.append(audit_headers)
+
+        for item in audits or []:
+            audit_ws.append([
+                excel_safe(item.get(h, ""))
+                for h in audit_headers
+            ])
+
+        _v20_style_sheet(audit_ws)
+        audit_widths = [12, 38, 42, 38, 42, 30, 28, 50, 75, 75]
+        for i, width in enumerate(audit_widths, start=1):
+            audit_ws.column_dimensions[get_column_letter(i)].width = width
+
+        rejected_ws = wb.create_sheet("Rejected Rows")
+        rejected_headers = [
+            "record_no", "name", "email", "reason",
+            "source_url", "profile_url",
+        ]
+        rejected_ws.append(rejected_headers)
+
+        for item in rejected or []:
+            rejected_ws.append([
+                excel_safe(item.get(h, ""))
+                for h in rejected_headers
+            ])
+
+        _v20_style_sheet(rejected_ws)
+        rejected_widths = [12, 38, 42, 40, 75, 75]
+        for i, width in enumerate(rejected_widths, start=1):
+            rejected_ws.column_dimensions[get_column_letter(i)].width = width
+
+        summary_ws = wb.create_sheet("Cleaning Summary")
+        summary_ws.append(["Metric", "Value"])
+        for key, value in (stats or {}).items():
+            summary_ws.append([key, value])
+
+        _v20_style_sheet(summary_ws)
+        summary_ws.column_dimensions["A"].width = 40
+        summary_ws.column_dimensions["B"].width = 22
+
+    # Robust save: temp file + atomic replace.
+    tmp = XLSX_FILE.with_name(
+        XLSX_FILE.stem + ".tmp.xlsx"
+    )
+    wb.save(tmp)
+
+    try:
+        tmp.replace(XLSX_FILE)
+    except PermissionError:
+        fallback = XLSX_FILE.with_name(
+            XLSX_FILE.stem + "_CLEANED.xlsx"
+        )
+        wb.save(fallback)
+        print(
+            f"   [SAVE WARNING] Main workbook is open/locked. "
+            f"Saved cleaned workbook to: {fallback.resolve()}",
+            flush=True,
+        )
+        return fallback
+
+    return XLSX_FILE
+
+
+def _v20_print_cleaning_summary(stats: Dict):
+    print("\n" + "=" * 110)
+    print("INTEGRATED ROBUST CLEANING COMPLETE")
+    print("=" * 110)
+    print(f"Original scraped rows           : {stats.get('original_rows', 0)}")
+    print(f"Invalid/junk emails removed     : {stats.get('invalid_removed', 0)}")
+    print(f"Email artifacts repaired        : {stats.get('email_artifacts_repaired', 0)}")
+    print(f"Duplicate observations merged   : {stats.get('duplicate_observations_merged', 0)}")
+    print(f"Strong names from email         : {stats.get('strong_email_names', 0)}")
+    print(f"Weak compact-email names        : {stats.get('weak_email_names', 0)}")
+    print(f"Names recovered from profile URL: {stats.get('profile_url_names', 0)}")
+    print(f"Bad shared-mailbox names removed: {stats.get('shared_names_removed', 0)}")
+    print(f"Shared/role rows                : {stats.get('shared_role_rows', 0)}")
+    print(f"Final cleaned rows              : {stats.get('final_rows', 0)}")
+    print(f"Unique valid emails             : {stats.get('unique_emails', 0)}")
+    print(f"Blank names remaining           : {stats.get('blank_names', 0)}")
+    print("=" * 110)
+
+
+# Preserve the original raw writer only for emergency/debug use.
+save_excel_raw_v20 = save_excel
+
+
+async def main():
+    """
+    V20 integrated main.
+
+    The scraper and cleaner now run as ONE command:
+        python university_staff_scraper.py
+
+    The final XLSX is already cleaned. No second script is required.
+    """
+    urls = read_urls()
+    if not urls:
+        raise RuntimeError("No URLs found in urls.xlsx")
+
+    llm_enabled = await ollama_available()
+
+    print("=" * 110)
+    print("UNIVERSAL UNIVERSITY + JOURNAL SCRAPER + INTEGRATED ROBUST CLEANER V20")
+    print("=" * 110)
+    print(f"Employee : {EMPLOYEE_NAME}")
+    print(f"Email    : {EMPLOYEE_EMAIL}")
+    print(f"URLs     : {len(urls)}")
+    print(f"Ollama   : {'ENABLED' if llm_enabled else 'DISABLED'}")
+    print("Cleaner  : INTEGRATED V20")
+    if llm_enabled:
+        print(f"Model    : {OLLAMA_MODEL}")
+    print(f"Output   : {XLSX_FILE.resolve()}")
+
+    errors: List[Dict] = []
+    master: List[PersonRecord] = []
+
+    llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
+    profile_sem = asyncio.Semaphore(PROFILE_CONCURRENCY)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS)
+
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            locale="en-US",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+        )
+
+        for idx, url in enumerate(urls, start=1):
+            print("\n" + "#" * 110)
+            print(f"URL {idx}/{len(urls)}")
+            print(url)
+            print("#" * 110)
+
+            try:
+                records = await scrape_source(
+                    context,
+                    url,
+                    llm_enabled,
+                    llm_sem,
+                    profile_sem,
+                    errors,
+                )
+
+                master.extend(records)
+
+                # Keep scraper-side duplicate suppression, but final authority is
+                # the robust V20 cleaning/dedupe stage.
+                master = _v19_dedupe(master)
+
+                # Save an already-cleaned checkpoint after every source.
+                checkpoint, audits, rejected, stats = clean_records_v20(master)
+                save_excel_v20(
+                    checkpoint,
+                    audits,
+                    rejected,
+                    stats,
+                )
+
+                save_errors(errors)
+
+                print(
+                    f"   [SOURCE DONE] scraped={len(records)} "
+                    f"master_raw={len(master)} "
+                    f"master_clean={len(checkpoint)}",
+                    flush=True,
+                )
+
+            except Exception as exc:
+                errors.append({
+                    "type": "source_exception",
+                    "source_url": url,
+                    "error": excel_safe(str(exc)),
+                })
+                save_errors(errors)
+
+            await polite_delay()
+
+        await browser.close()
+
+    # -----------------------------------------------------------------
+    # FINAL INTEGRATED CLEAN
+    # -----------------------------------------------------------------
+
+    final_records, audits, rejected, stats = clean_records_v20(master)
+
+    final_path = save_excel_v20(
+        final_records,
+        audits,
+        rejected,
+        stats,
+    )
+
+    # Add cleaner rejects to diagnostics without removing the audit sheet.
+    for item in rejected:
+        errors.append({
+            "type": "cleaner_rejected_record",
+            "reason": item.get("reason", ""),
+            "name": item.get("name", ""),
+            "email": item.get("email", ""),
+            "source_url": item.get("source_url", ""),
+            "profile_url": item.get("profile_url", ""),
+        })
+
+    errors.append({
+        "type": "integrated_cleaning_summary",
+        **stats,
+    })
+
+    save_errors(errors)
+
+    _v20_print_cleaning_summary(stats)
+
+    print("\n" + "=" * 110)
+    print("SCRAPING + CLEANING COMPLETE")
+    print("=" * 110)
+    print(f"URLs processed : {len(urls)}")
+    print(f"Raw records    : {len(master)}")
+    print(f"Final records  : {len(final_records)}")
+    print(f"Errors/rejects : {len(errors)}")
+    print(f"Excel          : {Path(final_path).resolve()}")
+    print(f"Errors         : {ERROR_FILE.resolve()}")
 
 if __name__ == '__main__':
     asyncio.run(main())

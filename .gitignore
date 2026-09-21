@@ -8,6 +8,10 @@ __pycache__/
 
 *.so
 
+urls.xlsx
+scraper_input_template.xlsx
+queries.xlsx
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
