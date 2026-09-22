@@ -13463,5 +13463,992 @@ async def scrape_source(
 
     return records
 
+
+# =============================================================================
+# V23 ROBUST SCOPED DIRECTORY SCRAPER
+# =============================================================================
+#
+# Objective:
+#   INPUT DIRECTORY
+#       -> SAME DIRECTORY pagination / load-more / infinite scroll
+#       -> local person cards OR local email evidence
+#       -> individual profile for THAT person only
+#       -> verified email/name/country
+#       -> integrated V20 cleaner
+#
+# Key safety rules:
+#   * Never crawl generic university navigation.
+#   * Never treat a section/service label as a person.
+#   * Never use every email in <main> as one person's alternates.
+#   * A profile fetch is identity-verified against the listing person.
+#   * Shared/role mailbox is kept only when locally bound to a person/card.
+#   * A valid personal email may survive with a blank/derived name.
+#   * Direct directory evidence wins over weaker profile/page-wide evidence.
+# =============================================================================
+
+V23_PROFILE_CONCURRENCY = max(6, PROFILE_CONCURRENCY)
+V23_MAX_DIRECTORY_PAGES = 100
+V23_MAX_PROFILES = 2500
+V23_MAX_LOCAL_EMAILS = 3
+V23_LOCAL_BLOCK_MAX_CHARS = 2600
+V23_HTTP_RETRIES = 3
+V23_BROWSER_RETRIES = 2
+
+V23_SECTION_LABELS = {
+    "academic services", "administrative services", "administrative staff",
+    "professional staff", "technical staff", "faculty", "staff", "team",
+    "our team", "our people", "people", "members", "directory",
+    "bioengineering", "materials science and engineering",
+    "chemical and biomolecular engineering", "biomedical engineering",
+    "electrical and computer engineering", "research", "education",
+    "student services", "student service center", "quick actions",
+    "find a person", "find a building", "webmaster", "contact us",
+}
+
+V23_SECTION_WORDS = {
+    "services", "service", "department", "faculty", "school", "college",
+    "university", "institute", "center", "centre", "program", "programme",
+    "office", "committee", "team", "group", "directory", "admissions",
+    "administration", "administrative", "support", "webmaster",
+}
+
+V23_ROLE_LOCAL_TOKENS = {
+    "info", "contact", "office", "admin", "administrator", "support",
+    "help", "faculty", "staff", "team", "department", "dept", "editor",
+    "editorial", "enquiries", "inquiries", "communications", "media",
+    "press", "admissions", "admission", "student", "students", "website",
+    "webmaster", "research", "clinic", "lab", "laboratory", "hr",
+    "jobs", "careers", "academic", "services", "service", "general",
+    "hello", "submission", "submissions",
+}
+
+
+def _v23_tokens(value: str) -> List[str]:
+    value = _v20_ascii(value)
+    return [x for x in re.findall(r"[a-z]+", value) if x]
+
+
+def _v23_is_role_mailbox(email: str) -> bool:
+    email = _v20_normalize_email(email)
+    if "@" not in email:
+        return True
+
+    local = email.split("@", 1)[0]
+    parts = [x for x in re.split(r"[._+\-]+", local) if x]
+
+    if not parts:
+        return True
+
+    # If any primary token is a service/role token, treat as shared.
+    if any(x in V23_ROLE_LOCAL_TOKENS for x in parts):
+        return True
+
+    return _v20_is_shared_email(email)
+
+
+def _v23_is_person_name(name: str) -> bool:
+    name = _v20_clean_name(name)
+    if not name or _v20_bad_name(name):
+        return False
+
+    low = _v20_ascii(name).strip(" :;,.|-")
+    if low in V23_SECTION_LABELS:
+        return False
+
+    toks = _v23_tokens(name)
+    if not toks:
+        return False
+
+    # Reject compact organization/section labels.
+    if len(toks) <= 7 and any(t in V23_SECTION_WORDS for t in toks):
+        # Allow genuine people with a role suffix only when name itself has
+        # at least two non-section tokens.
+        non_section = [t for t in toks if t not in V23_SECTION_WORDS]
+        if len(non_section) < 2:
+            return False
+
+    # Most human names have 2–6 useful tokens. Single names are allowed only
+    # if not a section label, because some cultures genuinely use one name.
+    return len(toks) <= 8
+
+
+def _v23_email_name_compatibility(name: str, email: str) -> int:
+    """
+    0 = no evidence, positive = compatible, negative = contradiction.
+    """
+    if not name or not email:
+        return 0
+
+    nt = _v20_name_tokens(name)
+    et = _v20_email_name_tokens(email)
+
+    if not nt or not et:
+        return 0
+
+    ns, es = set(nt), set(et)
+    if ns & es:
+        return 3
+
+    # Surname / initial style.
+    if nt[-1] == et[-1]:
+        return 3
+
+    # Email has two strong tokens and none overlap -> suspicious mismatch.
+    if len(et) >= 2:
+        return -3
+
+    return 0
+
+
+def _v23_profile_identity_name(soup: BeautifulSoup) -> str:
+    """
+    Find authoritative person name from profile-local markup.
+    """
+    selectors = [
+        "[itemtype*='Person'] [itemprop='name']",
+        "[itemprop='name']",
+        "main h1",
+        "article h1",
+        ".person-name",
+        ".profile-name",
+        ".staff-name",
+        ".faculty-name",
+        ".researcher-name",
+        "h1",
+    ]
+
+    for sel in selectors:
+        for el in soup.select(sel):
+            cand = clean_person_name_candidate(
+                clean_text(el.get_text(" ", strip=True))
+            )
+            if cand and _v23_is_person_name(cand):
+                return cand
+
+    # JSON-LD Person
+    for script in soup.select("script[type='application/ld+json']"):
+        raw = script.string or script.get_text("", strip=True)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        stack = [data]
+        while stack:
+            obj = stack.pop()
+            if isinstance(obj, dict):
+                typ = obj.get("@type")
+                types = typ if isinstance(typ, list) else [typ]
+                if any(str(x).casefold() == "person" for x in types if x):
+                    cand = clean_person_name_candidate(clean_text(obj.get("name", "")))
+                    if cand and _v23_is_person_name(cand):
+                        return cand
+                stack.extend(obj.values())
+            elif isinstance(obj, list):
+                stack.extend(obj)
+
+    return ""
+
+
+def _v23_names_match(expected: str, actual: str) -> bool:
+    if not expected or not actual:
+        return False
+
+    a = _v20_name_tokens(expected)
+    b = _v20_name_tokens(actual)
+    if not a or not b:
+        return False
+
+    # Surname must match when both names have >=2 tokens.
+    if len(a) >= 2 and len(b) >= 2:
+        if a[-1] != b[-1]:
+            return False
+
+        # Given-name compatibility: same token or same initial.
+        if a[0] == b[0]:
+            return True
+        if a[0][0] == b[0][0]:
+            return True
+
+        # Middle/alternate ordering.
+        if set(a[:-1]) & set(b[:-1]):
+            return True
+
+        return False
+
+    return bool(set(a) & set(b))
+
+
+def _v23_profile_root(soup: BeautifulSoup, actual_name: str) -> Tag:
+    """
+    Return smallest profile-local root, avoiding footer/global areas.
+    """
+    roots = [
+        soup.select_one("[itemtype*='Person']"),
+        soup.select_one("main article"),
+        soup.select_one("article"),
+        soup.select_one("main"),
+        soup.body,
+    ]
+
+    for root in roots:
+        if isinstance(root, Tag):
+            return root
+
+    return soup
+
+
+def _v23_profile_email_rows(
+    html: str,
+    final_url: str,
+    source_url: str,
+    expected_name: str,
+) -> List[PersonRecord]:
+    """
+    Strict profile parser: one verified person, local emails only.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    actual_name = _v23_profile_identity_name(soup)
+
+    if actual_name:
+        if expected_name and _v23_is_person_name(expected_name):
+            if not _v23_names_match(expected_name, actual_name):
+                return []
+        canonical_name = actual_name
+    else:
+        # Without authoritative name markup, only proceed when listing name is
+        # already credible. We still require email/name compatibility below.
+        if not expected_name or not _v23_is_person_name(expected_name):
+            return []
+        canonical_name = _v20_clean_name(expected_name)
+
+    root = _v23_profile_root(soup, canonical_name)
+
+    # Prefer contact-local nodes.
+    candidates: Dict[str, Tuple[int, Tag, str]] = {}
+
+    def add(e, node, score, kind):
+        e = normalize_email(e)
+        if not e or not isinstance(node, Tag):
+            return
+        old = candidates.get(e)
+        if old is None or score > old[0]:
+            candidates[e] = (score, node, kind)
+
+    for a in root.select("a[href^='mailto:'],a[href^='MAILTO:']"):
+        add(a.get("href", ""), a, 180, "mailto_href")
+        for e in extract_text_emails(clean_text(a.get_text(" ", strip=True))):
+            add(e, a, 185, "mailto_visible")
+
+    for el in root.select(
+        "[class*='email'],[id*='email'],[class*='contact'],[id*='contact'],"
+        "address,dd,dt,p,li,td"
+    ):
+        txt = clean_text(el.get_text(" ", strip=True))
+        if not txt or len(txt) > 1200 or "@" not in txt:
+            continue
+        for e in extract_text_emails(txt):
+            add(e, el, 125, "local_visible")
+
+    rows = []
+    for email, (base_score, node, kind) in candidates.items():
+        email = normalize_email(email)
+        if not email:
+            continue
+
+        block = _v22_smallest_local_person_block(node, email)
+        block_text = (
+            clean_text(block.get_text(" ", strip=True))
+            if isinstance(block, Tag)
+            else ""
+        )
+
+        shared = _v23_is_role_mailbox(email)
+        compatibility = _v23_email_name_compatibility(canonical_name, email)
+
+        # Personal mailbox: contradictory firstname.lastname evidence => reject.
+        if not shared and compatibility < 0:
+            continue
+
+        # Shared mailbox: keep only when contact-local block is compact and is
+        # clearly part of this profile, not a global footer/contact panel.
+        if shared:
+            if not isinstance(block, Tag):
+                continue
+            if len(block_text) > 1800:
+                continue
+
+            low = _v20_ascii(block_text)
+            name_tokens = _v20_name_tokens(canonical_name)
+            if name_tokens and not any(t in low for t in name_tokens[-2:]):
+                # Explicit profile root can still associate a shared mailbox,
+                # but require a contact-oriented block.
+                cls = " ".join(block.get("class", [])).casefold()
+                if not any(x in cls for x in ("contact", "profile", "person", "staff", "faculty")):
+                    continue
+
+        country = extract_country_from_text(block_text)
+        if not country:
+            country = country_from_tld(email)
+        if not country:
+            country = _v22_country_from_url(source_url)
+
+        affiliation = ""
+        phone = ""
+        try:
+            if isinstance(block, Tag):
+                affiliation = clean_text(
+                    split_affiliation_from_block(
+                        block, canonical_name, [email], ""
+                    )
+                )[:700]
+                phone = extract_phone(block)
+        except Exception:
+            pass
+
+        links = extract_links(root, final_url)
+        root_text = clean_text(root.get_text(" ", strip=True))[:7000]
+
+        rows.append(PersonRecord(
+            name=canonical_name,
+            email=email,
+            country=country or "",
+            email_type="shared/role" if shared else "personal",
+            page_type="UNIVERSITY_DIRECTORY",
+            affiliation=affiliation,
+            phone=phone,
+            orcid=links.get("orcid", "") or extract_orcid_text(root_text),
+            google_scholar=links.get("google_scholar", ""),
+            scopus_author_id=extract_scopus(root_text),
+            pubmed=links.get("pubmed", ""),
+            profile_url=final_url,
+            personal_homepage=links.get("personal_homepage", ""),
+            source_url=source_url,
+            country_source="profile_local_v23" if country else "",
+            confidence=min(100, base_score),
+            extraction_method=f"verified_profile_v23:{kind}",
+            scrape_status="accepted",
+        ))
+
+    # Prefer personal emails. If several personal emails are truly local, keep
+    # them as separate rows rather than unrelated alternates.
+    rows = _v23_dedupe_person_email(rows)
+    return rows
+
+
+def _v23_secondary_profile_links(
+    html: str,
+    current_url: str,
+    expected_name: str,
+) -> List[str]:
+    """
+    Very conservative secondary profile discovery.
+
+    Only follows a link when:
+      * text explicitly says profile/homepage/contact AND
+      * the surrounding block also contains the expected person name,
+      OR link text itself matches expected person name.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    expected_tokens = set(_v20_name_tokens(expected_name))
+    if not expected_tokens:
+        return []
+
+    found = []
+
+    for a in soup.select("a[href]"):
+        href = _v19_clean_url(a.get("href", ""), current_url)
+        if not href or _v19_is_noncontent_url(href):
+            continue
+
+        host = _v16_host(href)
+        if any(x in host for x in (
+            "orcid.org", "researchgate.", "scholar.google", "pubmed.",
+            "doi.org", "linkedin.", "facebook.", "instagram.",
+            "twitter.", "x.com", "youtube.", "vimeo.",
+        )):
+            continue
+
+        text = clean_text(
+            a.get_text(" ", strip=True)
+            or a.get("aria-label", "")
+            or a.get("title", "")
+        )
+        low = text.casefold()
+
+        score = 0
+        cand = clean_person_name_candidate(text)
+        if cand and _v23_is_person_name(cand):
+            if _v23_names_match(expected_name, cand):
+                score += 120
+
+        if any(x in low for x in (
+            "research profile", "researcher profile", "staff profile",
+            "faculty profile", "academic profile", "expert profile",
+            "personal homepage", "personal page", "view profile",
+        )):
+            parent = a.find_parent(["article", "section", "li", "div"])
+            ptxt = clean_text(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
+            ptoks = set(_v20_name_tokens(ptxt))
+            if expected_tokens & ptoks:
+                score += 100
+
+        if score >= 100:
+            found.append((score, href))
+
+    result = []
+    seen = set()
+    for _, href in sorted(found, key=lambda x: x[0], reverse=True):
+        k = normalize_url(href).casefold()
+        if k not in seen:
+            seen.add(k)
+            result.append(href)
+
+    return result[:3]
+
+
+async def _v23_fetch_person_profile(
+    context,
+    rec: PersonRecord,
+    sem: asyncio.Semaphore,
+    cache: Dict[str, Dict],
+) -> Tuple[List[PersonRecord], List[Dict]]:
+    diagnostics = []
+
+    async def fetch(url: str, browser: bool) -> Dict:
+        key = ("browser:" if browser else "http:") + normalize_url(url).casefold()
+        if key in cache:
+            return cache[key]
+
+        r = await (
+            playwright_fetch(context, url)
+            if browser
+            else fetch_http(url)
+        )
+        cache[key] = r
+        return r
+
+    async with sem:
+        last_html = ""
+        last_url = rec.profile_url
+
+        # HTTP then browser render of SAME profile.
+        for browser in (False, True):
+            r = await fetch(rec.profile_url, browser)
+            if not r.get("ok"):
+                continue
+
+            html = r.get("html", "") or ""
+            final_url = r.get("url") or rec.profile_url
+            last_html, last_url = html, final_url
+
+            rows = _v23_profile_email_rows(
+                html,
+                final_url,
+                rec.source_url,
+                rec.name,
+            )
+            if rows:
+                for row in rows:
+                    row.profile_url = rec.profile_url
+                    if browser:
+                        row.extraction_method += "+rendered"
+                return rows, diagnostics
+
+        # Conservative secondary profile only.
+        secondaries = _v23_secondary_profile_links(
+            last_html,
+            last_url,
+            rec.name,
+        )
+
+        for second in secondaries:
+            for browser in (False, True):
+                r = await fetch(second, browser)
+                if not r.get("ok"):
+                    continue
+
+                html = r.get("html", "") or ""
+                final_url = r.get("url") or second
+                rows = _v23_profile_email_rows(
+                    html,
+                    final_url,
+                    rec.source_url,
+                    rec.name,
+                )
+
+                if rows:
+                    for row in rows:
+                        row.personal_homepage = row.personal_homepage or final_url
+                        row.profile_url = rec.profile_url
+                        row.extraction_method += "+verified_secondary_profile"
+                    return rows, diagnostics
+
+        diagnostics.append({
+            "type": "profile_no_verified_email",
+            "source_url": rec.source_url,
+            "profile_url": rec.profile_url,
+            "name": rec.name,
+            "secondary_profiles_tried": secondaries,
+        })
+        return [], diagnostics
+
+
+def _v23_local_listing_rows(
+    html: str,
+    page_url: str,
+    source_url: str,
+) -> List[PersonRecord]:
+    """
+    Email-first directory extraction with strict local person binding.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    rows = []
+
+    for email, node, evidence_kind in _v22_email_evidence_nodes(soup):
+        email = normalize_email(email)
+        if not email:
+            continue
+
+        block = _v22_smallest_local_person_block(node, email)
+        name, name_score = _v22_nearest_name_for_email(block, node, email)
+        name = _v20_clean_name(name)
+
+        # If extracted text is a section/service label, discard it and let the
+        # cleaner derive from personal email instead.
+        if name and not _v23_is_person_name(name):
+            name = ""
+
+        shared = _v23_is_role_mailbox(email)
+
+        # Shared/global service emails without a real local person are noise.
+        if shared and not name:
+            continue
+
+        # If personal email and current name contradicts strong email tokens,
+        # don't bind the wrong person; cleaner will derive from the email.
+        if name and not shared:
+            if _v23_email_name_compatibility(name, email) < 0:
+                name = ""
+
+        local_text = (
+            clean_text(block.get_text(" ", strip=True))
+            if isinstance(block, Tag)
+            else ""
+        )
+
+        country = extract_country_from_text(local_text)
+        if not country:
+            country = country_from_tld(email)
+        if not country:
+            country = _v22_country_from_url(source_url)
+
+        profile_url = ""
+        if name:
+            profile_url = _v22_profile_link_from_local_block(
+                block,
+                page_url,
+                name,
+            )
+
+        affiliation = ""
+        phone = ""
+        if isinstance(block, Tag):
+            try:
+                affiliation = clean_text(
+                    split_affiliation_from_block(block, name, [email], "")
+                )[:700]
+            except Exception:
+                pass
+            try:
+                phone = extract_phone(block)
+            except Exception:
+                pass
+
+        rows.append(PersonRecord(
+            name=name,
+            email=email,
+            country=country or "",
+            email_type="shared/role" if shared else "personal",
+            page_type="UNIVERSITY_DIRECTORY",
+            affiliation=affiliation,
+            phone=phone,
+            profile_url=profile_url,
+            source_url=source_url,
+            country_source="listing_local_v23" if country else "",
+            confidence=min(99, 86 + min(13, max(0, name_score // 20))),
+            extraction_method=f"scoped_listing_v23:{evidence_kind}",
+            scrape_status="accepted",
+        ))
+
+    return _v23_dedupe_person_email(rows)
+
+
+def _v23_person_links(
+    html: str,
+    page_url: str,
+    source_url: str,
+) -> List[PersonRecord]:
+    """
+    Person links only from compact person-card structures or credible headings.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    found: Dict[str, PersonRecord] = {}
+
+    # First, profile links already attached to direct email/person rows.
+    for row in _v23_local_listing_rows(html, page_url, source_url):
+        if not row.profile_url or not row.name:
+            continue
+        key = normalize_url(row.profile_url).casefold()
+        found[key] = PersonRecord(
+            name=row.name,
+            page_type="UNIVERSITY_DIRECTORY",
+            profile_url=row.profile_url,
+            source_url=source_url,
+            confidence=96,
+            extraction_method="email_bound_profile_v23",
+        )
+
+    # Then semantic anchor discovery.
+    for a in soup.select("a[href]"):
+        score, url, name = _v21_profile_candidate(a, page_url)
+        name = _v20_clean_name(name)
+
+        if score < 100 or not url or not _v23_is_person_name(name):
+            continue
+
+        # Reject links whose visible/context name is a known section label.
+        if _v20_ascii(name).strip() in V23_SECTION_LABELS:
+            continue
+
+        key = normalize_url(url).casefold()
+        rec = PersonRecord(
+            name=name,
+            page_type="UNIVERSITY_DIRECTORY",
+            profile_url=url,
+            source_url=source_url,
+            confidence=min(98, score),
+            extraction_method="semantic_person_profile_v23",
+        )
+        old = found.get(key)
+        if old is None or rec.confidence > old.confidence:
+            found[key] = rec
+
+    return list(found.values())[:V23_MAX_PROFILES]
+
+
+def _v23_dedupe_person_email(records: List[PersonRecord]) -> List[PersonRecord]:
+    """
+    Deduplicate by person/profile/email without collapsing distinct people who
+    share a legitimate role mailbox.
+    """
+    merged: Dict[Tuple, PersonRecord] = {}
+
+    for rec in records:
+        email = normalize_email(rec.email)
+        if not email:
+            continue
+
+        name_key = " ".join(_v20_name_tokens(rec.name))
+        profile = normalize_url(rec.profile_url).casefold()
+
+        if name_key and profile:
+            key = ("person_profile_email", name_key, profile, email)
+        elif name_key:
+            key = ("person_email", name_key, email)
+        elif profile:
+            key = ("profile_email", profile, email)
+        else:
+            key = ("email", email)
+
+        if key not in merged:
+            merged[key] = rec
+        else:
+            merged[key] = _v20_merge_records(merged[key], rec)
+
+    return list(merged.values())
+
+
+def _v23_reconcile_direct_and_profile(
+    direct_rows: List[PersonRecord],
+    profile_rows: List[PersonRecord],
+) -> List[PersonRecord]:
+    """
+    Merge profile enrichment into direct directory mappings rather than emitting
+    a second row for the same person/email.
+    """
+    result: List[PersonRecord] = []
+    used_profile = set()
+
+    for direct in direct_rows:
+        best_idx = None
+        best_score = -1
+
+        for i, prof in enumerate(profile_rows):
+            if i in used_profile:
+                continue
+
+            score = 0
+            if direct.email and prof.email and normalize_email(direct.email) == normalize_email(prof.email):
+                score += 100
+
+            if direct.profile_url and prof.profile_url:
+                if normalize_url(direct.profile_url).casefold() == normalize_url(prof.profile_url).casefold():
+                    score += 80
+
+            if direct.name and prof.name and _v23_names_match(direct.name, prof.name):
+                score += 60
+
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_idx is not None and best_score >= 100:
+            merged = _v20_merge_records(direct, profile_rows[best_idx])
+            result.append(merged)
+            used_profile.add(best_idx)
+        else:
+            result.append(direct)
+
+    for i, prof in enumerate(profile_rows):
+        if i not in used_profile:
+            result.append(prof)
+
+    return _v23_dedupe_person_email(result)
+
+
+async def scrape_universal_v23(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print(
+        "   [V23] Robust scoped directory -> local person -> verified profile -> email",
+        flush=True,
+    )
+
+    fetch_cache: Dict[str, Dict] = {}
+    states: List[Tuple[str, str]] = []
+    queue = [source_url]
+    queued = {normalize_url(source_url).casefold()}
+    visited = set()
+
+    # -----------------------------------------------------------------
+    # 1. SOURCE DIRECTORY + TRUE PAGINATION ONLY
+    # -----------------------------------------------------------------
+    while queue and len(states) < V23_MAX_DIRECTORY_PAGES:
+        url = queue.pop(0)
+        key = normalize_url(url).casefold()
+        if key in visited:
+            continue
+        visited.add(key)
+
+        r = await _v22_fetch_directory_page(context, url)
+        if not r.get("ok"):
+            errors.append({
+                "type": "directory_page_fetch_failed",
+                "source_url": source_url,
+                "page_url": url,
+                "error": excel_safe(r.get("error", "")),
+            })
+            continue
+
+        actual = r.get("url") or url
+        html = r.get("html", "") or ""
+        if not html:
+            continue
+
+        states.append((actual, html))
+
+        for nxt in _v21_pagination_links(html, actual, source_url):
+            nk = normalize_url(nxt).casefold()
+            if nk not in visited and nk not in queued:
+                queued.add(nk)
+                queue.append(nxt)
+
+    # Browser load-more / infinite-scroll ONLY on original directory.
+    try:
+        browser_states = await _v22_browser_directory_states(
+            context,
+            source_url,
+            errors,
+        )
+
+        merged_states = []
+        seen = set()
+
+        for u, h in states + browser_states:
+            emails = tuple(sorted(
+                normalize_email(r.email)
+                for r in _v23_local_listing_rows(h, u, source_url)
+                if normalize_email(r.email)
+            ))
+            profiles = tuple(sorted(
+                normalize_url(r.profile_url).casefold()
+                for r in _v23_person_links(h, u, source_url)
+                if r.profile_url
+            ))
+            sig = (emails, profiles)
+
+            if sig in seen:
+                continue
+            seen.add(sig)
+            merged_states.append((u, h))
+
+        states = merged_states[:V23_MAX_DIRECTORY_PAGES]
+    except Exception as exc:
+        errors.append({
+            "type": "directory_browser_state_warning",
+            "source_url": source_url,
+            "error": excel_safe(str(exc)),
+        })
+
+    # -----------------------------------------------------------------
+    # 2. LOCAL DIRECT EMAILS + PERSON LINKS
+    # -----------------------------------------------------------------
+    direct_rows: List[PersonRecord] = []
+    placeholders: Dict[str, PersonRecord] = {}
+
+    for page_url, html in states:
+        direct_rows.extend(
+            _v23_local_listing_rows(html, page_url, source_url)
+        )
+
+        for rec in _v23_person_links(html, page_url, source_url):
+            pkey = normalize_url(rec.profile_url).casefold()
+            if not pkey:
+                continue
+
+            old = placeholders.get(pkey)
+            if old is None or rec.confidence > old.confidence:
+                placeholders[pkey] = rec
+
+    direct_rows = _v23_dedupe_person_email(direct_rows)
+
+    print(
+        f"   [DISCOVERY] directory_pages={len(states)} "
+        f"person_profiles={len(placeholders)} "
+        f"direct_person_emails={len(direct_rows)}",
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------
+    # 3. VERIFIED PERSON PROFILE FETCH
+    # -----------------------------------------------------------------
+    sem = asyncio.Semaphore(V23_PROFILE_CONCURRENCY)
+    results = await asyncio.gather(*(
+        _v23_fetch_person_profile(context, rec, sem, fetch_cache)
+        for rec in list(placeholders.values())[:V23_MAX_PROFILES]
+    ))
+
+    profile_rows: List[PersonRecord] = []
+    for rows, diags in results:
+        profile_rows.extend(rows)
+        errors.extend(diags)
+
+    profile_rows = _v23_dedupe_person_email(profile_rows)
+
+    # -----------------------------------------------------------------
+    # 4. RECONCILE, CLEAN, FINALIZE
+    # -----------------------------------------------------------------
+    combined = _v23_reconcile_direct_and_profile(
+        direct_rows,
+        profile_rows,
+    )
+
+    final = []
+    for rec in combined:
+        rec.source_url = source_url
+        ok, reason = _v19_finalize(rec)
+        if ok:
+            final.append(rec)
+        else:
+            errors.append({
+                "type": "rejected_record",
+                "reason": reason,
+                "name": excel_safe(rec.name),
+                "email": excel_safe(rec.email),
+                "country": excel_safe(rec.country),
+                "profile_url": excel_safe(rec.profile_url),
+                "source_url": source_url,
+                "method": excel_safe(rec.extraction_method),
+            })
+
+    final = _v23_dedupe_person_email(final)
+
+    errors.append({
+        "type": "email_coverage_summary",
+        "source_url": source_url,
+        "adapter": "robust_scoped_v23",
+        "directory_pages": len(states),
+        "person_profiles_discovered": len(placeholders),
+        "direct_person_email_rows": len(direct_rows),
+        "profile_email_rows": len(profile_rows),
+        "final_rows": len(final),
+        "final_unique_emails": len({r.email for r in final if r.email}),
+    })
+
+    print(
+        f"   [V23 QUALITY] directory_pages={len(states)} "
+        f"profiles={len(placeholders)} "
+        f"direct_rows={len(direct_rows)} "
+        f"profile_rows={len(profile_rows)} "
+        f"final={len(final)} "
+        f"unique_emails={len({r.email for r in final if r.email})}",
+        flush=True,
+    )
+
+    return final
+
+
+# Final V23 dispatcher.
+async def scrape_source(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print(f"\n   [SOURCE] {source_url}", flush=True)
+    print(
+        "   [ADAPTER] V23 robust scoped directory crawler",
+        flush=True,
+    )
+
+    records = await scrape_universal_v23(
+        context,
+        source_url,
+        llm_enabled,
+        llm_sem,
+        profile_sem,
+        errors,
+    )
+
+    print(
+        f"   [QUALITY] accepted={len(records)} "
+        f"unique_emails={len({r.email for r in records if r.email})} "
+        f"blank_names={sum(1 for r in records if not r.name)} "
+        f"blank_countries={sum(1 for r in records if not r.country)}",
+        flush=True,
+    )
+
+    if not records:
+        errors.append({
+            "type": "no_verified_emails",
+            "source_url": source_url,
+            "message": (
+                "No valid locally-bound person/email rows were found inside "
+                "the supplied directory scope."
+            ),
+        })
+
+    return records
+
 if __name__ == '__main__':
     asyncio.run(main())
