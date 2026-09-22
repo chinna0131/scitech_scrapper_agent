@@ -12581,5 +12581,887 @@ async def scrape_source(
 
     return records
 
+
+# =============================================================================
+# V22 SCOPED DIRECTORY + EMAIL-LOCAL EXTRACTION
+# =============================================================================
+#
+# Fixes V21 issues seen on Brown / Kiel:
+#   1. V21 referenced country_from_url(), which was not defined. On pages with
+#      direct person emails (such as Brown), that exception aborted the source
+#      before [DISCOVERY] was printed.
+#   2. Some directory pages expose email/name directly but do not wrap every
+#      person in a predictable "person/staff/card" CSS class. V22 starts from
+#      EMAIL EVIDENCE and finds the smallest local person block around it.
+#   3. Source-directory fetch now retries HTTP + Playwright and accepts usable
+#      rendered HTML even when the navigation response itself is imperfect.
+#   4. Profile enrichment remains scoped to people discovered from the supplied
+#      directory. We do not crawl unrelated university sections.
+#
+# Crawl model:
+#
+#   INPUT DIRECTORY
+#        ↓
+#   SAME-DIRECTORY PAGINATION / LOAD MORE
+#        ↓
+#   DIRECT PERSON EMAILS + PERSON LINKS
+#        ↓
+#   INDIVIDUAL PROFILE (when needed)
+#        ↓
+#   EMAIL
+#        ↓
+#   INTEGRATED V20 CLEANER
+# =============================================================================
+
+V22_MAX_DIRECTORY_PAGES = 100
+V22_PROFILE_CONCURRENCY = max(6, PROFILE_CONCURRENCY)
+V22_FETCH_RETRIES = 3
+V22_LOCAL_BLOCK_MAX_CHARS = 3200
+V22_LOCAL_BLOCK_MAX_EMAILS = 4
+
+
+def _v22_country_from_url(url: str) -> str:
+    """
+    Country fallback from source host TLD. Generic TLDs intentionally return blank.
+    """
+    try:
+        host = urlparse(clean_text(url)).netloc.casefold().replace("www.", "")
+        if "." not in host:
+            return ""
+        tld = host.rsplit(".", 1)[-1]
+        mapping = {
+            "au": "Australia", "at": "Austria", "be": "Belgium",
+            "br": "Brazil", "ca": "Canada", "ch": "Switzerland",
+            "cn": "China", "cz": "Czech Republic", "de": "Germany",
+            "dk": "Denmark", "eg": "Egypt", "es": "Spain",
+            "fi": "Finland", "fr": "France", "gr": "Greece",
+            "hk": "Hong Kong", "ie": "Ireland", "il": "Israel",
+            "in": "India", "ir": "Iran", "it": "Italy",
+            "jp": "Japan", "kr": "South Korea", "my": "Malaysia",
+            "nl": "Netherlands", "no": "Norway", "nz": "New Zealand",
+            "ph": "Philippines", "pk": "Pakistan", "pl": "Poland",
+            "pt": "Portugal", "sa": "Saudi Arabia", "se": "Sweden",
+            "sg": "Singapore", "th": "Thailand", "tr": "Turkey",
+            "tw": "Taiwan", "uk": "United Kingdom", "za": "South Africa",
+        }
+        return mapping.get(tld, "")
+    except Exception:
+        return ""
+
+
+def _v22_html_is_usable_directory(html: str) -> bool:
+    """
+    Accept a page if it contains meaningful body text plus either an email,
+    person-like heading/link, or directory-like structure.
+    """
+    if not html or len(html) < 400:
+        return False
+
+    soup = BeautifulSoup(html, "html.parser")
+    body_text = clean_text((soup.body or soup).get_text(" ", strip=True))
+    if len(body_text) < 250:
+        return False
+
+    if extract_text_emails(body_text):
+        return True
+    if soup.select_one("a[href^='mailto:'], [class*='person'], [class*='staff'], [class*='faculty'], [class*='member']"):
+        return True
+
+    personish = 0
+    for h in soup.select("h2,h3,h4,h5"):
+        n = clean_person_name_candidate(clean_text(h.get_text(" ", strip=True)))
+        if n and plausible_name(n) and len(_name_tokens(n)) >= 2:
+            personish += 1
+            if personish >= 2:
+                return True
+
+    return False
+
+
+async def _v22_fetch_directory_page(context, url: str) -> Dict:
+    """
+    Robust source/listing fetch:
+      requests retries -> Playwright retries.
+
+    Unlike the older helper, usable rendered HTML is retained even when a site
+    returns an odd navigation status but the browser actually rendered the data.
+    """
+    last = {"ok": False, "error": "not fetched", "html": "", "url": url}
+
+    # HTTP retries.
+    for attempt in range(V22_FETCH_RETRIES):
+        r = await fetch_http(url)
+        last = r
+        if r.get("ok") and _v22_html_is_usable_directory(r.get("html", "")):
+            return r
+        if attempt + 1 < V22_FETCH_RETRIES:
+            await asyncio.sleep(0.6 * (attempt + 1))
+
+    # Browser retries using a fresh page each time.
+    for attempt in range(2):
+        page = await context.new_page()
+        try:
+            print(f"   [PLAYWRIGHT DIRECTORY] {url}", flush=True)
+
+            response = None
+            try:
+                response = await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=PLAYWRIGHT_TIMEOUT,
+                )
+            except PlaywrightTimeoutError:
+                # A timeout does not necessarily mean the DOM is empty.
+                pass
+
+            try:
+                await page.wait_for_selector("body", timeout=8000)
+            except Exception:
+                pass
+
+            await dismiss_popups(page)
+            await page.wait_for_timeout(700)
+
+            html = await page.content()
+            final_url = page.url or url
+            status = response.status if response else None
+
+            candidate = {
+                "ok": _v22_html_is_usable_directory(html),
+                "error": "" if _v22_html_is_usable_directory(html) else (
+                    f"rendered page unusable"
+                    + (f" (HTTP {status})" if status else "")
+                ),
+                "html": html,
+                "url": final_url,
+            }
+
+            last = candidate
+            if candidate["ok"]:
+                return candidate
+        except Exception as exc:
+            last = {
+                "ok": False,
+                "error": str(exc),
+                "html": "",
+                "url": url,
+            }
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+        if attempt == 0:
+            await asyncio.sleep(0.8)
+
+    return last
+
+
+def _v22_email_evidence_nodes(soup: BeautifulSoup) -> List[Tuple[str, Tag, str]]:
+    """
+    Return email evidence with the DOM node where the evidence was found.
+
+    We intentionally avoid a page-wide row here. Each email must be localized
+    back to a person/contact block before name mapping.
+    """
+    found: Dict[str, Tuple[Tag, str]] = {}
+
+    def add(email, node, kind):
+        e = normalize_email(email)
+        if not e or not isinstance(node, Tag):
+            return
+        if e not in found:
+            found[e] = (node, kind)
+
+    # mailto is highest-quality evidence.
+    for a in soup.select("a[href^='mailto:'],a[href^='MAILTO:']"):
+        add(a.get("href", ""), a, "mailto")
+        for e in extract_text_emails(clean_text(a.get_text(" ", strip=True))):
+            add(e, a, "mailto_text")
+
+    # Common email/contact elements.
+    for el in soup.select(
+        "[class*='email'],[id*='email'],[class*='contact'],[id*='contact'],"
+        "p,dd,dt,address,td,li"
+    ):
+        txt = clean_text(el.get_text(" ", strip=True))
+        if not txt or len(txt) > 1200 or "@" not in txt:
+            continue
+        for e in extract_text_emails(txt):
+            add(e, el, "visible_local")
+
+    # data-email / data-mail.
+    for el in soup.select("[data-email],[data-mail],[data-address],[data-email-address]"):
+        for attr in ("data-email", "data-mail", "data-address", "data-email-address"):
+            if el.has_attr(attr):
+                add(el.get(attr, ""), el, attr)
+
+    return [
+        (email, node, kind)
+        for email, (node, kind) in found.items()
+    ]
+
+
+def _v22_smallest_local_person_block(node: Tag, email: str) -> Optional[Tag]:
+    """
+    Ascend from the email node and select the smallest useful block containing
+    only a few email addresses. This adapts to arbitrary markup.
+    """
+    if not isinstance(node, Tag):
+        return None
+
+    cur = node
+    best = node
+
+    for _ in range(9):
+        if not isinstance(cur, Tag):
+            break
+
+        if cur.name in {"nav", "header", "footer", "aside"}:
+            break
+
+        text = clean_text(cur.get_text(" ", strip=True))
+        if not text:
+            cur = cur.parent
+            continue
+
+        if len(text) > V22_LOCAL_BLOCK_MAX_CHARS:
+            break
+
+        emails = unique([
+            normalize_email(e)
+            for e in extract_text_emails(text)
+            if normalize_email(e)
+        ])
+
+        cls = " ".join(cur.get("class", [])).casefold()
+        ident = clean_text(cur.get("id", "")).casefold()
+        structural = cls + " " + ident
+
+        if len(emails) <= V22_LOCAL_BLOCK_MAX_EMAILS:
+            best = cur
+
+        # Prefer explicit card/row/article/person blocks.
+        if (
+            cur.name in {"article", "li", "tr", "section"}
+            or any(h in structural for h in V21_PERSON_CONTAINER_HINTS)
+        ):
+            if len(emails) <= V22_LOCAL_BLOCK_MAX_EMAILS:
+                best = cur
+                break
+
+        cur = cur.parent
+
+    return best
+
+
+def _v22_nearest_name_for_email(
+    block: Optional[Tag],
+    node: Tag,
+    email: str,
+) -> Tuple[str, int]:
+    """
+    Name resolution order:
+      1. name candidates inside local block
+      2. nearest heading inside local block
+      3. nearest preceding heading near the email node
+      4. strong email-derived name (only firstname.lastname-like)
+    """
+    candidates: List[Tuple[int, str]] = []
+
+    if isinstance(block, Tag):
+        try:
+            for score, cand in collect_name_candidates(block, email):
+                cand = clean_person_name_candidate(cand)
+                if cand and plausible_name(cand):
+                    candidates.append((score + email_name_score(cand, email), cand))
+        except Exception:
+            pass
+
+        for h in block.select("h1,h2,h3,h4,h5,h6,[itemprop='name'],[class*='name']"):
+            cand = clean_person_name_candidate(clean_text(h.get_text(" ", strip=True)))
+            if cand and plausible_name(cand):
+                candidates.append((150 + email_name_score(cand, email), cand))
+
+    # Preceding heading is very important for TYPO3/Drupal-like team pages.
+    cur = node
+    for distance in range(5):
+        if not isinstance(cur, Tag):
+            break
+
+        prev = cur.find_previous(["h2", "h3", "h4", "h5", "h6"])
+        if isinstance(prev, Tag):
+            cand = clean_person_name_candidate(clean_text(prev.get_text(" ", strip=True)))
+            if cand and plausible_name(cand):
+                candidates.append((125 - distance * 8 + email_name_score(cand, email), cand))
+                break
+
+        cur = cur.parent
+
+    # Reject obvious section labels.
+    filtered = []
+    for score, cand in candidates:
+        low = cand.casefold().strip(" :;,.|-")
+        if low in V21_NON_PERSON_TEXT:
+            continue
+        if any(x in low for x in V21_BAD_PROFILE_TEXT):
+            continue
+        if len(_name_tokens(cand)) < 1:
+            continue
+        filtered.append((score, cand))
+
+    if filtered:
+        filtered.sort(key=lambda x: x[0], reverse=True)
+        return filtered[0][1], filtered[0][0]
+
+    # Strong email-name only as fallback.
+    derived = _v20_strong_name_from_email(email)
+    if derived:
+        return derived, 90
+
+    return "", 0
+
+
+def _v22_profile_link_from_local_block(
+    block: Optional[Tag],
+    page_url: str,
+    expected_name: str,
+) -> str:
+    if not isinstance(block, Tag):
+        return ""
+
+    best = (0, "")
+    expected = set(_name_tokens(expected_name))
+
+    for a in block.select("a[href]"):
+        href = _v19_clean_url(a.get("href", ""), page_url)
+        if not href or _v19_is_noncontent_url(href):
+            continue
+        if href.casefold().startswith(("mailto:", "tel:")):
+            continue
+
+        text = clean_person_name_candidate(clean_text(
+            a.get_text(" ", strip=True)
+            or a.get("aria-label", "")
+            or a.get("title", "")
+        ))
+        score = 0
+
+        if text and plausible_name(text):
+            tt = set(_name_tokens(text))
+            if expected and tt and (expected & tt):
+                score += 120
+
+        # Image/profile links may have no useful anchor text but live inside the
+        # same compact person block.
+        if not text and expected_name:
+            score += 55
+
+        if _v16_same_org(page_url, href):
+            score += 20
+
+        host = _v16_host(href)
+        if any(x in host for x in (
+            "orcid.org", "researchgate.", "scholar.google",
+            "pubmed.", "doi.org", "linkedin.", "facebook.",
+            "instagram.", "twitter.", "x.com", "youtube."
+        )):
+            continue
+
+        if score > best[0]:
+            best = (score, href)
+
+    return best[1] if best[0] >= 70 else ""
+
+
+def _v22_listing_email_rows(
+    html: str,
+    page_url: str,
+    source_url: str,
+) -> List[PersonRecord]:
+    """
+    EMAIL-FIRST direct extraction from the supplied directory page.
+
+    Crucially:
+      * valid email is retained even if a name cannot be proven
+      * name is taken only from the same local block / nearby heading / strong
+        email pattern
+      * no footer/global page email harvesting
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    rows: List[PersonRecord] = []
+
+    for email, node, evidence_kind in _v22_email_evidence_nodes(soup):
+        email = normalize_email(email)
+        if not email:
+            continue
+
+        block = _v22_smallest_local_person_block(node, email)
+        name, name_score = _v22_nearest_name_for_email(block, node, email)
+
+        local_text = (
+            clean_text(block.get_text(" ", strip=True))
+            if isinstance(block, Tag)
+            else ""
+        )
+
+        country = extract_country_from_text(local_text)
+        if not country:
+            country = country_from_tld(email)
+        if not country:
+            country = _v22_country_from_url(source_url)
+
+        profile_url = _v22_profile_link_from_local_block(
+            block,
+            page_url,
+            name,
+        )
+
+        affiliation = ""
+        phone = ""
+        if isinstance(block, Tag):
+            try:
+                affiliation = clean_text(
+                    split_affiliation_from_block(block, name, [email], "")
+                )[:700]
+            except Exception:
+                affiliation = ""
+            try:
+                phone = extract_phone(block)
+            except Exception:
+                phone = ""
+
+        rows.append(PersonRecord(
+            name=name,
+            email=email,
+            country=country or "",
+            email_type=(
+                "shared/role"
+                if is_generic_email(email) or is_strict_generic_email(email)
+                else "personal"
+            ),
+            page_type="UNIVERSITY_DIRECTORY",
+            affiliation=affiliation,
+            phone=phone,
+            profile_url=profile_url,
+            source_url=source_url,
+            country_source=(
+                "listing_local_block"
+                if country
+                else ""
+            ),
+            confidence=min(99, 82 + min(17, max(0, name_score // 15))),
+            extraction_method=f"scoped_email_local_v22:{evidence_kind}",
+            scrape_status="accepted",
+        ))
+
+    return _v19_dedupe(rows)
+
+
+def _v22_discover_profiles(
+    html: str,
+    page_url: str,
+    source_url: str,
+) -> List[PersonRecord]:
+    """
+    Combine V21 semantic person links with profile URLs attached to direct-email
+    local blocks. The latter improves pages where profile anchors use images or
+    "View profile" instead of the person's name.
+    """
+    found: Dict[str, PersonRecord] = {}
+
+    # V21 name-anchor discovery.
+    for rec in _v21_discover_profiles(html, page_url, source_url):
+        key = normalize_url(rec.profile_url).casefold()
+        if key:
+            found[key] = rec
+
+    # Email-local blocks may reveal profile links not found by anchor-name logic.
+    for rec in _v22_listing_email_rows(html, page_url, source_url):
+        if not rec.profile_url:
+            continue
+        key = normalize_url(rec.profile_url).casefold()
+        if key in found:
+            continue
+
+        found[key] = PersonRecord(
+            name=rec.name,
+            page_type="UNIVERSITY_DIRECTORY",
+            profile_url=rec.profile_url,
+            source_url=source_url,
+            confidence=max(88, int(rec.confidence or 0)),
+            extraction_method="email_local_profile_discovery_v22",
+        )
+
+    return list(found.values())[:V21_MAX_PROFILES]
+
+
+async def _v22_browser_directory_states(
+    context,
+    source_url: str,
+    errors: List[Dict],
+) -> List[Tuple[str, str]]:
+    """
+    Load-more / same-directory next / infinite scroll only.
+    """
+    states = []
+    page = await context.new_page()
+
+    try:
+        print(f"   [BROWSER DIRECTORY] {source_url}", flush=True)
+
+        try:
+            await page.goto(
+                source_url,
+                wait_until="domcontentloaded",
+                timeout=PLAYWRIGHT_TIMEOUT,
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        try:
+            await page.wait_for_selector("body", timeout=8000)
+        except Exception:
+            pass
+
+        await dismiss_popups(page)
+        await page.wait_for_timeout(700)
+
+        seen = set()
+        stable = 0
+
+        for _ in range(25):
+            html = await page.content()
+            current = page.url or source_url
+
+            person_count = len(_v22_discover_profiles(html, current, source_url))
+            email_count = len(_v22_listing_email_rows(html, current, source_url))
+            text_len = len(clean_text(
+                BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+            ))
+
+            sig = (person_count, email_count, text_len)
+            if sig not in seen:
+                seen.add(sig)
+                states.append((current, html))
+                stable = 0
+            else:
+                stable += 1
+
+            if stable >= 2:
+                break
+
+            clicked = False
+
+            # Explicit next/load-more only.
+            selectors = [
+                "button:has-text('Load more')",
+                "button:has-text('Show more')",
+                "button:has-text('View more')",
+                "button:has-text('More')",
+                "a:has-text('Load more')",
+                "a:has-text('Show more')",
+                "a:has-text('View more')",
+                ".pagination .next",
+                ".pager .next",
+                "a[rel='next']",
+                "[aria-label*='next' i]",
+            ]
+
+            for selector in selectors:
+                try:
+                    loc = page.locator(selector).first
+                    if await loc.count() == 0 or not await loc.is_visible():
+                        continue
+
+                    href = await loc.get_attribute("href")
+                    if href:
+                        candidate = _v19_clean_url(href, current)
+                        if candidate and not _v21_same_directory_scope(
+                            source_url,
+                            candidate,
+                        ):
+                            continue
+
+                    before = await page.content()
+                    await loc.click(timeout=4000)
+                    await page.wait_for_timeout(900)
+                    after = await page.content()
+
+                    if after != before:
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if clicked:
+                continue
+
+            # Infinite scroll, accepted only if people or email counts increase.
+            before_html = await page.content()
+            before_people = len(_v22_discover_profiles(
+                before_html, page.url, source_url
+            ))
+            before_emails = len(_v22_listing_email_rows(
+                before_html, page.url, source_url
+            ))
+
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1000)
+            except Exception:
+                stable += 1
+                continue
+
+            after_html = await page.content()
+            after_people = len(_v22_discover_profiles(
+                after_html, page.url, source_url
+            ))
+            after_emails = len(_v22_listing_email_rows(
+                after_html, page.url, source_url
+            ))
+
+            if after_people <= before_people and after_emails <= before_emails:
+                stable += 1
+
+    except Exception as exc:
+        errors.append({
+            "type": "v22_browser_directory_warning",
+            "source_url": source_url,
+            "error": excel_safe(str(exc)),
+        })
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    return states
+
+
+async def scrape_universal_v22(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print(
+        "   [V22] Scoped directory + email-local extraction + profile enrichment",
+        flush=True,
+    )
+
+    fetch_cache: Dict[str, Dict] = {}
+    states: List[Tuple[str, str]] = []
+    queue = [source_url]
+    queued = {normalize_url(source_url).casefold()}
+    visited = set()
+
+    # -----------------------------------------------------------------
+    # 1. INPUT DIRECTORY + SAME-DIRECTORY PAGINATION ONLY
+    # -----------------------------------------------------------------
+    while queue and len(states) < V22_MAX_DIRECTORY_PAGES:
+        url = queue.pop(0)
+        key = normalize_url(url).casefold()
+        if key in visited:
+            continue
+        visited.add(key)
+
+        r = await _v22_fetch_directory_page(context, url)
+        if not r.get("ok"):
+            errors.append({
+                "type": "directory_page_fetch_failed",
+                "source_url": source_url,
+                "page_url": url,
+                "error": excel_safe(r.get("error", "")),
+            })
+            continue
+
+        actual = r.get("url") or url
+        html = r.get("html", "") or ""
+        if not html:
+            continue
+
+        states.append((actual, html))
+
+        for nxt in _v21_pagination_links(html, actual, source_url):
+            nk = normalize_url(nxt).casefold()
+            if nk not in visited and nk not in queued:
+                queued.add(nk)
+                queue.append(nxt)
+
+    # JS load more / infinite scroll from the same source.
+    try:
+        browser_states = await _v22_browser_directory_states(
+            context,
+            source_url,
+            errors,
+        )
+
+        known = set()
+        merged = []
+        for u, h in states + browser_states:
+            direct_count = len(_v22_listing_email_rows(h, u, source_url))
+            profile_count = len(_v22_discover_profiles(h, u, source_url))
+            sig = (
+                normalize_url(u).casefold(),
+                direct_count,
+                profile_count,
+                hash(clean_text(
+                    BeautifulSoup(h, "html.parser").get_text(" ", strip=True)
+                )[:12000]),
+            )
+            if sig in known:
+                continue
+            known.add(sig)
+            merged.append((u, h))
+
+        states = merged[:V22_MAX_DIRECTORY_PAGES]
+    except Exception as exc:
+        errors.append({
+            "type": "directory_browser_state_warning",
+            "source_url": source_url,
+            "error": excel_safe(str(exc)),
+        })
+
+    # -----------------------------------------------------------------
+    # 2. DIRECT EMAILS + PERSON PROFILE LINKS
+    # -----------------------------------------------------------------
+    direct_rows: List[PersonRecord] = []
+    placeholders: Dict[str, PersonRecord] = {}
+
+    for page_url, html in states:
+        direct_rows.extend(
+            _v22_listing_email_rows(html, page_url, source_url)
+        )
+
+        for rec in _v22_discover_profiles(html, page_url, source_url):
+            pkey = normalize_url(rec.profile_url).casefold()
+            if not pkey:
+                continue
+            old = placeholders.get(pkey)
+            if old is None or rec.confidence > old.confidence:
+                placeholders[pkey] = rec
+
+    direct_rows = _v19_dedupe(direct_rows)
+
+    print(
+        f"   [DISCOVERY] directory_pages={len(states)} "
+        f"person_profiles={len(placeholders)} "
+        f"direct_person_emails={len(direct_rows)}",
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------
+    # 3. FETCH ONLY DISCOVERED PERSON PROFILES
+    # -----------------------------------------------------------------
+    sem = asyncio.Semaphore(V22_PROFILE_CONCURRENCY)
+
+    profile_results = await asyncio.gather(*(
+        _v19_fetch_profile(context, rec, sem, fetch_cache)
+        for rec in list(placeholders.values())[:V21_MAX_PROFILES]
+    ))
+
+    profile_rows: List[PersonRecord] = []
+    for rows, diags in profile_results:
+        profile_rows.extend(rows)
+        errors.extend(diags)
+
+    # -----------------------------------------------------------------
+    # 4. PREFER DIRECT DIRECTORY MAPPING, ENRICH WITH PROFILE RESULTS
+    # -----------------------------------------------------------------
+    combined = _v19_dedupe(direct_rows + profile_rows)
+
+    final = []
+    for rec in combined:
+        rec.source_url = source_url
+        ok, reason = _v19_finalize(rec)
+        if ok:
+            final.append(rec)
+        else:
+            errors.append({
+                "type": "rejected_record",
+                "reason": reason,
+                "name": excel_safe(rec.name),
+                "email": excel_safe(rec.email),
+                "country": excel_safe(rec.country),
+                "profile_url": excel_safe(rec.profile_url),
+                "source_url": source_url,
+                "method": excel_safe(rec.extraction_method),
+            })
+
+    final = _v19_dedupe(final)
+
+    errors.append({
+        "type": "email_coverage_summary",
+        "source_url": source_url,
+        "adapter": "scoped_email_local_v22",
+        "directory_pages": len(states),
+        "person_profiles_discovered": len(placeholders),
+        "direct_person_email_rows": len(direct_rows),
+        "profile_email_rows": len(profile_rows),
+        "final_rows": len(final),
+        "final_unique_emails": len({r.email for r in final if r.email}),
+    })
+
+    print(
+        f"   [V22 QUALITY] directory_pages={len(states)} "
+        f"profiles={len(placeholders)} "
+        f"direct_rows={len(direct_rows)} "
+        f"profile_rows={len(profile_rows)} "
+        f"final={len(final)} "
+        f"unique_emails={len({r.email for r in final if r.email})}",
+        flush=True,
+    )
+
+    return final
+
+
+# Final dispatcher: V22 overrides V21.
+async def scrape_source(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print(f"\n   [SOURCE] {source_url}", flush=True)
+    print(
+        "   [ADAPTER] V22 scoped directory + email-local crawler",
+        flush=True,
+    )
+
+    records = await scrape_universal_v22(
+        context,
+        source_url,
+        llm_enabled,
+        llm_sem,
+        profile_sem,
+        errors,
+    )
+
+    print(
+        f"   [QUALITY] accepted={len(records)} "
+        f"unique_emails={len({r.email for r in records if r.email})} "
+        f"blank_names={sum(1 for r in records if not r.name)} "
+        f"blank_countries={sum(1 for r in records if not r.country)}",
+        flush=True,
+    )
+
+    if not records:
+        errors.append({
+            "type": "no_verified_emails",
+            "source_url": source_url,
+            "message": (
+                "No valid public email was found within the supplied directory "
+                "scope after local-email and person-profile extraction."
+            ),
+        })
+
+    return records
+
 if __name__ == '__main__':
     asyncio.run(main())
