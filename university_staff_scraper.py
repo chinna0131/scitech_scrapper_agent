@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup, Tag, NavigableString
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -27,7 +28,7 @@ except Exception:
 
 EMPLOYEE_NAME = "Thriveni"
 EMPLOYEE_EMAIL = "dyavanapallythriveni2002@gmail.com"
-FILE_NAME = "Thriveni_Nano_University_DATA_02-09-2026"
+FILE_NAME = "Thriveni_Nano_University_DATA_22-09-2026"
 INPUT_FILE = Path("urls.xlsx")
 
 USE_LLM = True
@@ -11745,6 +11746,840 @@ async def main():
     print(f"Errors/rejects : {len(errors)}")
     print(f"Excel          : {Path(final_path).resolve()}")
     print(f"Errors         : {ERROR_FILE.resolve()}")
+
+
+# =============================================================================
+# V21 SCOPE-AWARE DIRECTORY CRAWLER
+# =============================================================================
+#
+# Strict crawl model:
+#
+#   INPUT DIRECTORY PAGE
+#       -> pagination belonging to THAT directory only
+#       -> person cards / person links found on those directory pages
+#       -> individual person profile
+#       -> email
+#
+# It intentionally DOES NOT:
+#   * crawl generic university navigation
+#   * follow "research", "study", "events", "HR", "news", "facilities", etc.
+#   * expand into sibling departments/directories
+#   * use arbitrary internal links as listing pages
+#
+# Profile URL format remains unrestricted. The scope restriction applies to
+# LISTING/PAGINATION discovery, not to individual person profiles.
+# =============================================================================
+
+V21_MAX_DIRECTORY_PAGES = 80
+V21_MAX_PROFILES = 2500
+V21_PROFILE_CONCURRENCY = max(6, PROFILE_CONCURRENCY)
+V21_STABLE_BROWSER_ROUNDS = 2
+
+V21_NON_PERSON_TEXT = {
+    "home", "about", "about us", "contact", "contact us", "research",
+    "study", "students", "news", "events", "library", "facilities",
+    "services", "resources", "support", "admissions", "careers", "jobs",
+    "give", "donate", "alumni", "faculty", "staff", "people", "our people",
+    "team", "our team", "members", "directory", "read more", "learn more",
+    "view more", "show more", "next", "previous",
+}
+
+V21_PERSON_CONTAINER_HINTS = (
+    "person", "people", "staff", "faculty", "member", "profile",
+    "researcher", "scientist", "investigator", "expert", "team",
+    "directory-item", "people-card", "person-card", "staff-card",
+)
+
+V21_BAD_PROFILE_TEXT = (
+    "event", "seminar", "lecture", "award", "news", "article", "publication",
+    "research area", "research group", "student organization", "course",
+    "program", "programme", "admission", "application", "facility", "service",
+)
+
+
+def _v21_url_parts(url: str):
+    try:
+        p = urlparse(normalize_url(url))
+        return (
+            p.scheme.casefold(),
+            p.netloc.casefold().replace("www.", ""),
+            p.path.rstrip("/") or "/",
+            p.query,
+        )
+    except Exception:
+        return "", "", "", ""
+
+
+def _v21_path_segments(url: str) -> List[str]:
+    try:
+        path = urlparse(normalize_url(url)).path
+        return [unquote(x).casefold() for x in path.split("/") if x]
+    except Exception:
+        return []
+
+
+def _v21_same_directory_scope(source_url: str, candidate_url: str) -> bool:
+    """
+    True only when candidate looks like another page/state of the SAME directory.
+
+    Accepted examples:
+        /people?page=2
+        /people/?p=3
+        /faculty/page/2/
+        /directory?offset=50
+        same path with pagination/filter query
+
+    Rejected examples:
+        /research/
+        /events/
+        /people/graduate-students/
+        /faculty/another-department/
+        sibling university/service pages
+    """
+    s_scheme, s_host, s_path, s_query = _v21_url_parts(source_url)
+    c_scheme, c_host, c_path, c_query = _v21_url_parts(candidate_url)
+
+    if not s_host or not c_host:
+        return False
+    if s_host != c_host:
+        return False
+
+    # Exact path: query-string pagination/filter state is safe.
+    if c_path == s_path:
+        return True
+
+    s_seg = _v21_path_segments(source_url)
+    c_seg = _v21_path_segments(candidate_url)
+
+    # Classic path pagination: /page/2, /page/3
+    if len(c_seg) >= len(s_seg) + 2 and c_seg[:len(s_seg)] == s_seg:
+        tail = c_seg[len(s_seg):]
+        if len(tail) == 2 and tail[0] in {"page", "p"} and tail[1].isdigit():
+            return True
+
+    # Some sites append only a numeric page segment.
+    if len(c_seg) == len(s_seg) + 1 and c_seg[:len(s_seg)] == s_seg:
+        if c_seg[-1].isdigit():
+            return True
+
+    # Some pagination rewrites the final "page-N" segment.
+    if len(c_seg) == len(s_seg):
+        common = 0
+        for a, b in zip(s_seg, c_seg):
+            if a == b:
+                common += 1
+            else:
+                break
+        if common >= max(1, len(s_seg) - 1):
+            last = c_seg[-1] if c_seg else ""
+            if re.fullmatch(r"(?:page[-_]?)?\d+", last):
+                return True
+
+    return False
+
+
+def _v21_pagination_links(html: str, page_url: str, source_url: str) -> List[str]:
+    """
+    Detect pagination only when structurally tied to the current directory and
+    the resulting URL remains in the original directory scope.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    out = []
+    seen = set()
+
+    for a in soup.select("a[href]"):
+        href = _v19_clean_url(a.get("href", ""), page_url)
+        if not href or _v19_is_noncontent_url(href):
+            continue
+        if not _v21_same_directory_scope(source_url, href):
+            continue
+
+        text = clean_text(a.get_text(" ", strip=True)).casefold()
+        aria = clean_text(a.get("aria-label", "")).casefold()
+        title = clean_text(a.get("title", "")).casefold()
+        rel = " ".join(a.get("rel", [])).casefold() if a.get("rel") else ""
+
+        parent = a.find_parent(["nav", "ul", "ol", "div"])
+        parent_cls = (
+            " ".join(parent.get("class", [])).casefold()
+            if isinstance(parent, Tag)
+            else ""
+        )
+        parent_id = (
+            clean_text(parent.get("id", "")).casefold()
+            if isinstance(parent, Tag)
+            else ""
+        )
+
+        score = 0
+        if "next" in rel:
+            score += 120
+        if text in {"next", "next page", ">", "›", "»"}:
+            score += 100
+        if "next" in aria or "next" in title:
+            score += 100
+        if any(x in parent_cls + " " + parent_id for x in (
+            "pagination", "pager", "paging", "pages", "page-nav"
+        )):
+            score += 60
+        if re.fullmatch(r"\d+", text):
+            score += 35
+
+        # Query/path itself looks paginated.
+        p = urlparse(href)
+        if re.search(
+            r"(?:^|[?&])(?:page|paged|p|offset|start|from|cursor)=",
+            "?" + p.query,
+            re.I,
+        ):
+            score += 35
+        if re.search(r"/(?:page|p)/\d+/?$", p.path, re.I):
+            score += 35
+
+        if score < 70:
+            continue
+
+        key = normalize_url(href).casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(href)
+
+    return out[:40]
+
+
+def _v21_person_container(anchor: Tag) -> Optional[Tag]:
+    """
+    Find a compact, person-like card/row around an anchor.
+    """
+    cur = anchor
+    best = None
+
+    for _ in range(8):
+        if not isinstance(cur, Tag):
+            break
+
+        if cur.name in {"nav", "header", "footer", "aside"}:
+            return None
+
+        text = clean_text(cur.get_text(" ", strip=True))
+        cls = " ".join(cur.get("class", [])).casefold()
+        ident = clean_text(cur.get("id", "")).casefold()
+
+        if len(text) > 3000:
+            break
+
+        hints = cls + " " + ident
+        if any(h in hints for h in V21_PERSON_CONTAINER_HINTS):
+            best = cur
+            break
+
+        if cur.name in {"article", "li", "tr"} and len(text) <= 1800:
+            best = cur
+
+        cur = cur.parent
+
+    return best
+
+
+def _v21_profile_candidate(anchor: Tag, page_url: str) -> Tuple[int, str, str]:
+    """
+    Person profile candidate based on human-name + local person-card evidence.
+    URL path format is irrelevant.
+    """
+    href = clean_text(anchor.get("href", ""))
+    if not href or href.casefold().startswith((
+        "#", "mailto:", "tel:", "javascript:"
+    )):
+        return 0, "", ""
+
+    if anchor.find_parent(["nav", "header", "footer", "aside"]) is not None:
+        return 0, "", ""
+
+    url = _v19_clean_url(href, page_url)
+    if not url or _v19_is_noncontent_url(url):
+        return 0, "", ""
+
+    raw_text = clean_text(
+        anchor.get_text(" ", strip=True)
+        or anchor.get("aria-label", "")
+        or anchor.get("title", "")
+    )
+    name = clean_person_name_candidate(raw_text)
+
+    if not name or not plausible_name(name):
+        return 0, "", ""
+
+    low = name.casefold().strip(" :;,.|-")
+    if low in V21_NON_PERSON_TEXT:
+        return 0, "", ""
+    if any(x in low for x in V21_BAD_PROFILE_TEXT):
+        return 0, "", ""
+
+    tokens = _name_tokens(name)
+    if len(tokens) < 2:
+        return 0, "", ""
+
+    container = _v21_person_container(anchor)
+    score = 35 + min(30, len(tokens) * 8)
+
+    # A person-like compact block is the key evidence.
+    if isinstance(container, Tag):
+        ctext = clean_text(container.get_text(" ", strip=True)).casefold()
+        cls = " ".join(container.get("class", [])).casefold()
+
+        score += 45
+
+        if any(x in cls for x in V21_PERSON_CONTAINER_HINTS):
+            score += 35
+
+        if any(cue in ctext for cue in V19_PERSON_CONTEXT_CUES):
+            score += 30
+
+        if container.select_one(
+            "h2,h3,h4,h5,[itemprop='name'],[class*='name']"
+        ):
+            score += 20
+
+        # Local email/phone strongly supports person-card status.
+        if container.select_one("a[href^='mailto:'],a[href^='tel:']"):
+            score += 20
+    else:
+        # Heading anchor can still be a profile link, but must be strong.
+        if anchor.find_parent(["h2", "h3", "h4", "h5"]) is not None:
+            score += 35
+        else:
+            return 0, "", ""
+
+    # Same institution is useful, but external institutional profiles remain allowed.
+    if _v16_same_org(page_url, url):
+        score += 15
+
+    return score, url, name
+
+
+def _v21_discover_profiles(
+    html: str,
+    page_url: str,
+    source_url: str,
+) -> List[PersonRecord]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    found: Dict[str, PersonRecord] = {}
+
+    for a in soup.select("a[href]"):
+        score, url, name = _v21_profile_candidate(a, page_url)
+        if score < 100:
+            continue
+
+        key = normalize_url(url).casefold()
+        rec = PersonRecord(
+            name=name,
+            page_type="UNIVERSITY_DIRECTORY",
+            profile_url=url,
+            source_url=source_url,
+            confidence=min(98, score),
+            extraction_method="scoped_person_profile_v21",
+        )
+
+        old = found.get(key)
+        if old is None or rec.confidence > old.confidence:
+            found[key] = rec
+
+    # Embedded JSON profiles are accepted only when their names are plausible.
+    try:
+        for rec in _v18_embedded_profile_urls(html, page_url):
+            if not rec.name or not plausible_name(rec.name):
+                continue
+            key = normalize_url(rec.profile_url).casefold()
+            if not key:
+                continue
+            rec.source_url = source_url
+            rec.extraction_method = "scoped_embedded_profile_v21"
+            old = found.get(key)
+            if old is None or rec.confidence > old.confidence:
+                found[key] = rec
+    except Exception:
+        pass
+
+    return list(found.values())[:V21_MAX_PROFILES]
+
+
+def _v21_listing_email_rows(
+    html: str,
+    page_url: str,
+    source_url: str,
+) -> List[PersonRecord]:
+    """
+    Extract direct emails from compact person cards/rows only.
+
+    This deliberately avoids page-wide fallback email harvesting, which caused
+    footer/navigation/service emails to contaminate directory results.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    rows: List[PersonRecord] = []
+
+    # Candidate cards: structural person blocks and compact rows/articles.
+    candidates = []
+    selectors = (
+        "[class*='person'],[class*='people'],[class*='staff'],"
+        "[class*='faculty'],[class*='member'],[class*='profile'],"
+        "[class*='researcher'],article,li,tr"
+    )
+    for block in soup.select(selectors):
+        if block.find_parent(["nav", "header", "footer", "aside"]) is not None:
+            continue
+        text = clean_text(block.get_text(" ", strip=True))
+        if not text or len(text) > 2600:
+            continue
+        if "@" not in text and not block.select_one("a[href^='mailto:']"):
+            continue
+        candidates.append(block)
+
+    seen_blocks = set()
+    for block in candidates:
+        signature = id(block)
+        if signature in seen_blocks:
+            continue
+        seen_blocks.add(signature)
+
+        # Get only emails present in this local block.
+        emails = []
+        for a in block.select("a[href^='mailto:'],a[href^='MAILTO:']"):
+            e = normalize_email(a.get("href", ""))
+            if e:
+                emails.append(e)
+        for e in extract_text_emails(clean_text(block.get_text(" ", strip=True))):
+            if e:
+                emails.append(normalize_email(e))
+        emails = [e for e in unique(emails) if normalize_email(e)]
+
+        if not emails:
+            continue
+
+        # Resolve person name from this same block.
+        name = ""
+        name_candidates = collect_name_candidates(block, emails[0])
+        for _, cand in name_candidates:
+            cand = clean_person_name_candidate(cand)
+            if cand and plausible_name(cand):
+                low = cand.casefold()
+                if low not in V21_NON_PERSON_TEXT and not any(
+                    x in low for x in V21_BAD_PROFILE_TEXT
+                ):
+                    name = cand
+                    break
+
+        # If no plausible person name, don't create person mappings from a directory card.
+        if not name:
+            continue
+
+        # Find profile link from this same card.
+        profile_url = ""
+        best_score = 0
+        for a in block.select("a[href]"):
+            score, url, cand_name = _v21_profile_candidate(a, page_url)
+            if score > best_score:
+                best_score = score
+                profile_url = url
+
+        local_text = clean_text(block.get_text(" ", strip=True))
+        country = extract_country_from_text(local_text)
+        if not country:
+            country = country_from_tld(emails[0]) or country_from_url(source_url)
+
+        for email in emails:
+            if not normalize_email(email):
+                continue
+
+            rows.append(PersonRecord(
+                name=name,
+                email=normalize_email(email),
+                country=country or "",
+                email_type=(
+                    "shared/role"
+                    if is_generic_email(email) or is_strict_generic_email(email)
+                    else "personal"
+                ),
+                page_type="UNIVERSITY_DIRECTORY",
+                affiliation=clean_text(
+                    split_affiliation_from_block(block, name, emails, "")
+                )[:700],
+                phone=extract_phone(block),
+                profile_url=profile_url,
+                source_url=source_url,
+                country_source="listing_person_card" if country else "",
+                confidence=92,
+                extraction_method="scoped_listing_card_v21",
+                scrape_status="accepted",
+            ))
+
+    return _v19_dedupe(rows)
+
+
+async def _v21_browser_directory_states(
+    context,
+    source_url: str,
+    errors: List[Dict],
+) -> List[Tuple[str, str]]:
+    """
+    Browser-only load-more/infinite-scroll support on the SAME directory page.
+
+    No arbitrary link following.
+    """
+    states: List[Tuple[str, str]] = []
+    page = await context.new_page()
+
+    try:
+        await page.goto(
+            source_url,
+            wait_until="domcontentloaded",
+            timeout=REQUEST_TIMEOUT * 1000,
+        )
+        await page.wait_for_timeout(900)
+
+        stable_rounds = 0
+        seen_sigs = set()
+
+        for _ in range(20):
+            html = await page.content()
+            current = page.url or source_url
+
+            sig = (
+                len(html),
+                len(_v21_discover_profiles(html, current, source_url)),
+                len(_v21_listing_email_rows(html, current, source_url)),
+            )
+
+            if sig not in seen_sigs:
+                seen_sigs.add(sig)
+                states.append((current, html))
+                stable_rounds = 0
+            else:
+                stable_rounds += 1
+
+            if stable_rounds >= V21_STABLE_BROWSER_ROUNDS:
+                break
+
+            clicked = False
+
+            # Click only pagination/load-more controls, never arbitrary navigation.
+            selectors = [
+                "button:has-text('Load more')",
+                "button:has-text('Show more')",
+                "button:has-text('View more')",
+                "a:has-text('Load more')",
+                "a:has-text('Show more')",
+                "a:has-text('View more')",
+                "[aria-label*='next' i]",
+                ".pagination .next",
+                ".pager .next",
+                ".pagination a[rel='next']",
+                "a[rel='next']",
+            ]
+
+            for selector in selectors:
+                try:
+                    loc = page.locator(selector).first
+                    if await loc.count() == 0:
+                        continue
+                    if not await loc.is_visible():
+                        continue
+
+                    # For anchors, verify href stays in directory scope.
+                    href = await loc.get_attribute("href")
+                    if href:
+                        candidate = _v19_clean_url(href, current)
+                        if candidate and not _v21_same_directory_scope(
+                            source_url,
+                            candidate,
+                        ):
+                            continue
+
+                    before = await page.content()
+                    await loc.click(timeout=4000)
+                    await page.wait_for_timeout(900)
+                    after = await page.content()
+
+                    if after != before:
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if clicked:
+                continue
+
+            # Infinite scroll: only keep it if actual person/email count grows.
+            try:
+                before_html = await page.content()
+                before_people = len(
+                    _v21_discover_profiles(before_html, page.url, source_url)
+                )
+                before_rows = len(
+                    _v21_listing_email_rows(before_html, page.url, source_url)
+                )
+
+                await page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)"
+                )
+                await page.wait_for_timeout(1000)
+
+                after_html = await page.content()
+                after_people = len(
+                    _v21_discover_profiles(after_html, page.url, source_url)
+                )
+                after_rows = len(
+                    _v21_listing_email_rows(after_html, page.url, source_url)
+                )
+
+                if after_people > before_people or after_rows > before_rows:
+                    continue
+            except Exception:
+                pass
+
+            stable_rounds += 1
+
+    except Exception as exc:
+        errors.append({
+            "type": "scoped_browser_pagination_warning",
+            "source_url": source_url,
+            "error": excel_safe(str(exc)),
+        })
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    return states
+
+
+async def scrape_universal_v21(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print(
+        "   [V21] Scoped directory -> pagination -> person profile -> email",
+        flush=True,
+    )
+
+    fetch_cache: Dict[str, Dict] = {}
+    states: List[Tuple[str, str]] = []
+    visited = set()
+    queue = [source_url]
+    queued = {normalize_url(source_url).casefold()}
+
+    # -----------------------------------------------------------------
+    # 1. SOURCE DIRECTORY + ITS PAGINATION ONLY
+    # -----------------------------------------------------------------
+    while queue and len(states) < V21_MAX_DIRECTORY_PAGES:
+        url = queue.pop(0)
+        key = normalize_url(url).casefold()
+
+        if key in visited:
+            continue
+        visited.add(key)
+
+        r = await fetch_http(url)
+        if not r.get("ok"):
+            r = await playwright_fetch(context, url)
+
+        if not r.get("ok"):
+            errors.append({
+                "type": "directory_page_fetch_failed",
+                "source_url": source_url,
+                "page_url": url,
+                "error": excel_safe(r.get("error", "")),
+            })
+            continue
+
+        actual = r.get("url") or url
+        html = r.get("html", "") or ""
+        if not html:
+            continue
+
+        states.append((actual, html))
+
+        for nxt in _v21_pagination_links(html, actual, source_url):
+            nk = normalize_url(nxt).casefold()
+            if nk not in visited and nk not in queued:
+                queued.add(nk)
+                queue.append(nxt)
+
+    # Same-page JS pagination/load more/infinite scroll.
+    try:
+        browser_states = await _v21_browser_directory_states(
+            context,
+            source_url,
+            errors,
+        )
+
+        known = set()
+        merged = []
+
+        for u, h in states + browser_states:
+            sig = (
+                normalize_url(u).casefold(),
+                len(_v21_discover_profiles(h, u, source_url)),
+                len(_v21_listing_email_rows(h, u, source_url)),
+                hash(clean_text(BeautifulSoup(h, "html.parser").get_text(" ", strip=True))[:8000]),
+            )
+            if sig in known:
+                continue
+            known.add(sig)
+            merged.append((u, h))
+
+        states = merged[:V21_MAX_DIRECTORY_PAGES]
+    except Exception as exc:
+        errors.append({
+            "type": "directory_browser_state_warning",
+            "source_url": source_url,
+            "error": excel_safe(str(exc)),
+        })
+
+    # -----------------------------------------------------------------
+    # 2. PERSON CARDS / PERSON LINKS FROM THOSE DIRECTORY PAGES ONLY
+    # -----------------------------------------------------------------
+    direct_rows: List[PersonRecord] = []
+    placeholders: Dict[str, PersonRecord] = {}
+
+    for page_url, html in states:
+        direct_rows.extend(
+            _v21_listing_email_rows(html, page_url, source_url)
+        )
+
+        for rec in _v21_discover_profiles(html, page_url, source_url):
+            pkey = normalize_url(rec.profile_url).casefold()
+            if not pkey:
+                continue
+
+            old = placeholders.get(pkey)
+            if old is None or rec.confidence > old.confidence:
+                placeholders[pkey] = rec
+
+            if len(placeholders) >= V21_MAX_PROFILES:
+                break
+
+    print(
+        f"   [DISCOVERY] directory_pages={len(states)} "
+        f"person_profiles={len(placeholders)} "
+        f"direct_person_emails={len(direct_rows)}",
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------
+    # 3. INDIVIDUAL PERSON PROFILE -> EMAIL
+    # -----------------------------------------------------------------
+    sem = asyncio.Semaphore(V21_PROFILE_CONCURRENCY)
+    profile_items = list(placeholders.values())[:V21_MAX_PROFILES]
+
+    results = await asyncio.gather(*(
+        _v19_fetch_profile(context, rec, sem, fetch_cache)
+        for rec in profile_items
+    ))
+
+    profile_rows: List[PersonRecord] = []
+    for rows, diags in results:
+        profile_rows.extend(rows)
+        errors.extend(diags)
+
+    # -----------------------------------------------------------------
+    # 4. MERGE + INTEGRATED V20 CLEANER
+    # -----------------------------------------------------------------
+    combined = _v19_dedupe(direct_rows + profile_rows)
+
+    final = []
+    for rec in combined:
+        rec.source_url = source_url
+        ok, reason = _v19_finalize(rec)
+        if ok:
+            final.append(rec)
+        else:
+            errors.append({
+                "type": "rejected_record",
+                "reason": reason,
+                "name": excel_safe(rec.name),
+                "email": excel_safe(rec.email),
+                "country": excel_safe(rec.country),
+                "profile_url": excel_safe(rec.profile_url),
+                "source_url": source_url,
+                "method": excel_safe(rec.extraction_method),
+            })
+
+    final = _v19_dedupe(final)
+
+    errors.append({
+        "type": "email_coverage_summary",
+        "source_url": source_url,
+        "adapter": "scoped_directory_v21",
+        "directory_pages": len(states),
+        "person_profiles_discovered": len(placeholders),
+        "profile_email_rows": len(profile_rows),
+        "direct_person_email_rows": len(direct_rows),
+        "final_rows": len(final),
+        "final_unique_emails": len({
+            r.email for r in final if r.email
+        }),
+    })
+
+    print(
+        f"   [V21 QUALITY] directory_pages={len(states)} "
+        f"profiles={len(placeholders)} "
+        f"profile_rows={len(profile_rows)} "
+        f"final={len(final)} "
+        f"unique_emails={len({r.email for r in final if r.email})}",
+        flush=True,
+    )
+
+    return final
+
+
+# Final V21 dispatcher overrides earlier generic routing.
+async def scrape_source(
+    context,
+    source_url: str,
+    llm_enabled: bool,
+    llm_sem: asyncio.Semaphore,
+    profile_sem: asyncio.Semaphore,
+    errors: List[Dict],
+) -> List[PersonRecord]:
+    print(f"\n   [SOURCE] {source_url}", flush=True)
+    print(
+        "   [ADAPTER] V21 scope-aware directory crawler",
+        flush=True,
+    )
+
+    records = await scrape_universal_v21(
+        context,
+        source_url,
+        llm_enabled,
+        llm_sem,
+        profile_sem,
+        errors,
+    )
+
+    print(
+        f"   [QUALITY] accepted={len(records)} "
+        f"unique_emails={len({r.email for r in records if r.email})} "
+        f"blank_names={sum(1 for r in records if not r.name)} "
+        f"blank_countries={sum(1 for r in records if not r.country)}",
+        flush=True,
+    )
+
+    if not records:
+        errors.append({
+            "type": "no_verified_emails",
+            "source_url": source_url,
+            "message": (
+                "No valid person/email rows found inside the input directory "
+                "scope after directory pagination and person-profile checks."
+            ),
+        })
+
+    return records
 
 if __name__ == '__main__':
     asyncio.run(main())
