@@ -19,15 +19,15 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 INDEX_URL = "https://www.gfmer.ch/International_activities_En/GFMER_members_list.htm"
-DEFAULT_OUTPUT = "gfmer_members.xlsx"
-DEFAULT_CHECKPOINT = "gfmer_members_checkpoint.csv"
+DEFAULT_OUTPUT = "output/Sobha/gfmer_data/gfmer_members.xlsx"
+DEFAULT_CHECKPOINT = "output/Sobha/gfmer_data/gfmer_members_checkpoint.csv"
 TIMEOUT = 45
 MAX_WORKERS = 8
 REQUEST_DELAY_SECONDS = 0.15
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 YEAR_RE = re.compile(r"/SRH-Course-(\d{4})/", re.I)
-GENERIC_EMAIL_PREFIXES = {"info", "contact", "office", "admin", "support", "webmaster", "secretariat"}
+GENERIC_EMAIL_PREFIXES = {"info","contact","office","admin","support","webmaster","secretariat"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("gfmer")
@@ -125,28 +125,159 @@ class MemberRecord:
 
 
 def parse_member_index(html: str) -> list[IndexMember]:
-    soup = BeautifulSoup(html, "lxml")
-    table = soup.select_one("table#example")
+    """
+    Parse the old GFMER member table robustly.
+
+    Important:
+    Do NOT rely on `tbody tr`. The page uses legacy HTML and different parsers
+    may normalize/move <tr> elements. We therefore inspect all rows below
+    table#example and require at least:
+        member/profile link | city | country
+    """
+    soup = BeautifulSoup(
+        html,
+        "lxml",
+    )
+
+    table = soup.select_one(
+        "table#example"
+    )
+
     if not table:
-        raise RuntimeError("Could not find table#example on the GFMER member directory page.")
-    members, seen_urls = [], set()
-    for row in table.select("tbody tr"):
-        cells = row.find_all("td", recursive=False)
+        # Diagnostic fallback in case the ID is altered by malformed markup.
+        candidates = soup.find_all("table")
+
+        log.error(
+            "table#example not found. Total tables in page: %s",
+            len(candidates),
+        )
+
+        raise RuntimeError(
+            "Could not find table#example on the GFMER member directory page."
+        )
+
+    all_rows = table.find_all("tr")
+
+    log.info(
+        "Raw table rows found: %s",
+        len(all_rows),
+    )
+
+    members: list[IndexMember] = []
+    seen_urls: set[str] = set()
+
+    for row_no, row in enumerate(
+        all_rows,
+        start=1,
+    ):
+        cells = row.find_all(
+            "td",
+            recursive=False,
+        )
+
+        # Some malformed HTML causes td nesting. Use non-recursive first,
+        # then fall back to regular find_all.
+        if len(cells) < 3:
+            cells = row.find_all(
+                "td"
+            )
+
         if len(cells) < 3:
             continue
-        link = cells[0].select_one("a[href]")
+
+        link = cells[0].find(
+            "a",
+            href=True,
+        )
+
         if not link:
             continue
-        profile_url = urljoin(INDEX_URL, clean(link.get("href")))
-        if not profile_url or profile_url in seen_urls:
+
+        href = clean(
+            link.get("href")
+        )
+
+        if not href:
             continue
-        seen_urls.add(profile_url)
-        members.append(IndexMember(
-            member_text=clean(link.get_text(" ", strip=True)),
-            city=clean(cells[1].get_text(" ", strip=True)),
-            country=clean(cells[2].get_text(" ", strip=True)),
-            profile_url=profile_url,
-        ))
+
+        profile_url = urljoin(
+            INDEX_URL,
+            href,
+        )
+
+        member_text = clean(
+            link.get_text(
+                " ",
+                strip=True,
+            )
+        )
+
+        city = clean(
+            cells[1].get_text(
+                " ",
+                strip=True,
+            )
+        )
+
+        country = clean(
+            cells[2].get_text(
+                " ",
+                strip=True,
+            )
+        )
+
+        # Keep only useful profile-like links from this directory.
+        if not member_text:
+            continue
+
+        if profile_url in seen_urls:
+            continue
+
+        seen_urls.add(
+            profile_url
+        )
+
+        members.append(
+            IndexMember(
+                member_text=member_text,
+                city=city,
+                country=country,
+                profile_url=profile_url,
+            )
+        )
+
+    log.info(
+        "Valid member/profile rows parsed: %s",
+        len(members),
+    )
+
+    if not members:
+        # Write a diagnostic HTML copy so you can inspect exactly what your
+        # machine received from GFMER.
+        diagnostic_path = Path(
+            "gfmer_index_debug.html"
+        )
+
+        try:
+            diagnostic_path.write_text(
+                html,
+                encoding="utf-8",
+                errors="ignore",
+            )
+
+            log.error(
+                "No member rows parsed. Saved received HTML to: %s",
+                diagnostic_path.resolve(),
+            )
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "GFMER directory page was downloaded, but zero member rows were "
+            "parsed. Check gfmer_index_debug.html; the site may have returned "
+            "a different/interstitial page."
+        )
+
     return members
 
 
@@ -244,8 +375,7 @@ def infer_title_org_from_lines(lines: list[str], name: str, email: str) -> tuple
 
 
 def infer_department(text: str) -> str:
-    for pattern in [r"(Department of [^.;|]+)", r"(School of [^.;|]+)", r"(Faculty of [^.;|]+)",
-                    r"(College of [^.;|]+)", r"(Institute of [^.;|]+)"]:
+    for pattern in [r"(Department of [^.;|]+)", r"(School of [^.;|]+)", r"(Faculty of [^.;|]+)", r"(College of [^.;|]+)", r"(Institute of [^.;|]+)"]:
         m = re.search(pattern, text, re.I)
         if m:
             return clean(m.group(1))
@@ -364,8 +494,7 @@ def parse_profile(index_member: IndexMember, html: str) -> MemberRecord:
         if parsed_name:
             name = parsed_name
 
-    title, organization = infer_title_org_from_lines(contact_lines[1:] if len(contact_lines) > 1 else contact_lines,
-                                                     name, email)
+    title, organization = infer_title_org_from_lines(contact_lines[1:] if len(contact_lines) > 1 else contact_lines, name, email)
     affiliation = title_paragraphs[1] if len(title_paragraphs) >= 2 else index_affiliation
     if not organization and affiliation:
         organization = affiliation
@@ -423,7 +552,25 @@ def scrape_one(index_member: IndexMember) -> MemberRecord:
 
 
 def save_checkpoint(records: list[MemberRecord], checkpoint_path: Path) -> None:
-    pd.DataFrame([asdict(r) for r in records]).to_csv(checkpoint_path, index=False, encoding="utf-8-sig")
+    checkpoint_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    columns = list(
+        MemberRecord.__dataclass_fields__.keys()
+    )
+
+    df = pd.DataFrame(
+        [asdict(r) for r in records],
+        columns=columns,
+    )
+
+    df.to_csv(
+        checkpoint_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 def load_checkpoint(checkpoint_path: Path) -> dict[str, MemberRecord]:
@@ -463,8 +610,7 @@ def export_excel(records: list[MemberRecord], output_path: Path) -> None:
         df = df.sort_values(by=["country", "name"], na_position="last").reset_index(drop=True)
     errors_df = df[df["status"] == "ERROR"].copy() if not df.empty else pd.DataFrame()
     email_df = df[df["email"].fillna("").astype(str).str.strip() != ""].copy() if not df.empty else pd.DataFrame()
-    unique_email_df = email_df.drop_duplicates(subset=["email"],
-                                               keep="first").copy() if not email_df.empty else pd.DataFrame()
+    unique_email_df = email_df.drop_duplicates(subset=["email"], keep="first").copy() if not email_df.empty else pd.DataFrame()
     summary_df = pd.DataFrame([
         {"metric": "Total directory members", "value": len(df)},
         {"metric": "Profiles with email", "value": len(email_df)},
@@ -482,24 +628,42 @@ def export_excel(records: list[MemberRecord], output_path: Path) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Scrape the complete GFMER member directory and visit each public member/profile page.")
+    parser = argparse.ArgumentParser(description="Scrape the complete GFMER member directory and visit each public member/profile page.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--workers", type=int, default=MAX_WORKERS)
     parser.add_argument("--limit", type=int, default=0, help="Optional test limit; 0 means all members.")
-    parser.add_argument("--fresh", action="store_true",
-                        help="Ignore existing checkpoint and scrape every profile again.")
+    parser.add_argument("--fresh", action="store_true", help="Ignore existing checkpoint and scrape every profile again.")
     args = parser.parse_args()
 
     output_path = Path(args.output)
     checkpoint_path = Path(args.checkpoint)
+
+    # Create both directories before any checkpoint/export operation.
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    checkpoint_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    log.info("Output directory     : %s", output_path.parent.resolve())
+    log.info("Checkpoint directory : %s", checkpoint_path.parent.resolve())
 
     log.info("Downloading member directory...")
     members = parse_member_index(get_html(INDEX_URL))
     if args.limit > 0:
         members = members[:args.limit]
     log.info("Directory members found: %s", len(members))
+
+    if not members:
+        raise RuntimeError(
+            "No GFMER members were discovered. Aborting instead of writing "
+            "an empty checkpoint/Excel."
+        )
 
     completed = {} if args.fresh else load_checkpoint(checkpoint_path)
     if completed:
@@ -518,11 +682,9 @@ def main():
                 record = future.result()
                 completed[member.profile_url] = record
                 processed_now += 1
-                log.info("[%s/%s] %s | %s | %s", processed_now, len(pending), record.name or member.member_text,
-                         record.email or "NO EMAIL", record.status)
+                log.info("[%s/%s] %s | %s | %s", processed_now, len(pending), record.name or member.member_text, record.email or "NO EMAIL", record.status)
                 if processed_now % 25 == 0:
-                    save_checkpoint([completed[m.profile_url] for m in members if m.profile_url in completed],
-                                    checkpoint_path)
+                    save_checkpoint([completed[m.profile_url] for m in members if m.profile_url in completed], checkpoint_path)
 
     final_records = [
         completed.get(m.profile_url, MemberRecord(
