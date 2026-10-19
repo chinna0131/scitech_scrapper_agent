@@ -14552,10 +14552,11 @@ V24_SCRAPEGRAPH_ENABLED = True
 V24_SCRAPEGRAPH_MODEL = OLLAMA_MODEL
 V24_SCRAPEGRAPH_MODEL_TOKENS = 8192
 V24_SCRAPEGRAPH_VERBOSE = False
-V24_AI_MAX_DIRECTORY_CALLS_PER_SOURCE = 6
-V24_AI_MAX_PROFILE_CALLS_PER_SOURCE = 30
+V24_AI_MAX_DIRECTORY_CALLS_PER_SOURCE = 3
+V24_AI_MAX_PROFILE_CALLS_PER_SOURCE = 4
 V24_AI_COVERAGE_THRESHOLD = 0.80
-V24_AI_TIMEOUT_SECONDS = 150
+V24_AI_TIMEOUT_SECONDS = 60
+V24_PROFILE_CONCURRENCY = max(4, min(8, PROFILE_CONCURRENCY))
 
 _V24_SCRAPEGRAPH_IMPORT_ERROR = ""
 _V24_SCRAPEGRAPH_AVAILABLE_CACHE = None
@@ -14627,20 +14628,71 @@ def _v24_scrapegraph_run_sync(html: str, prompt: str):
     return graph.run()
 
 
+def _v25_scrapegraph_worker(queue, html: str, prompt: str):
+    try:
+        queue.put(("ok", _v24_scrapegraph_run_sync(html, prompt)))
+    except BaseException as exc:
+        queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _v25_scrapegraph_process_sync(html: str, prompt: str):
+    import multiprocessing as mp
+    import queue as queue_module
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue(maxsize=1)
+    proc = ctx.Process(target=_v25_scrapegraph_worker, args=(q, html, prompt))
+    proc.daemon = True
+    proc.start()
+
+    try:
+        proc.join(V24_AI_TIMEOUT_SECONDS)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(3)
+            if proc.is_alive():
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                proc.join(2)
+            return None
+
+        try:
+            status, payload = q.get_nowait()
+        except queue_module.Empty:
+            return None
+
+        return payload if status == "ok" else None
+    finally:
+        try:
+            q.close()
+            q.cancel_join_thread()
+        except Exception:
+            pass
+        if proc.is_alive():
+            try:
+                proc.terminate()
+                proc.join(2)
+            except Exception:
+                pass
+
+
 async def _v24_scrapegraph_run(html: str, prompt: str):
     if not _v24_scrapegraph_available():
         return None
 
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_v24_scrapegraph_run_sync, html, prompt),
-            timeout=V24_AI_TIMEOUT_SECONDS,
+        # The child process is forcibly terminated on timeout, so unlike the
+        # previous asyncio.to_thread(ScrapeGraphAI) implementation, no orphaned
+        # LLM thread can hold Python open for 300+ seconds at shutdown.
+        return await asyncio.to_thread(
+            _v25_scrapegraph_process_sync,
+            html,
+            prompt,
         )
-    except asyncio.TimeoutError:
-        return None
     except Exception:
         return None
-
 
 def _v24_extract_people_objects(value) -> List[Dict]:
     """
@@ -15071,6 +15123,15 @@ def _v24_should_ai_directory_fallback(
         trigger = True
         reasons.append("profile_discovery_low")
 
+    # Important for JS/Pure-style directories: deterministic selectors may see
+    # no conventional headings/profiles even though rendered HTML contains the
+    # directory. In that case invoke the bounded AI fallback once.
+    visible_text_len = len(clean_text(soup.get_text(" ", strip=True)))
+    if direct_unique == 0 and profile_count == 0 and visible_text_len >= 300:
+        trigger = True
+        if "zero_deterministic_results" not in reasons:
+            reasons.append("zero_deterministic_results")
+
     return trigger, {
         "email_evidence": evidence_count,
         "direct_unique": direct_unique,
@@ -15283,6 +15344,10 @@ async def _v24_fetch_person_profile(
     if ai_budget.get("profile_calls", 0) >= V24_AI_MAX_PROFILE_CALLS_PER_SOURCE:
         return rows, diagnostics
 
+    # Reserve the slot before any await. This prevents dozens of concurrent
+    # profile tasks from all passing the budget check at the same time.
+    ai_budget["profile_calls"] = ai_budget.get("profile_calls", 0) + 1
+
     # Fetch same profile HTML (cached where available).
     html = ""
     final_url = rec.profile_url
@@ -15305,10 +15370,6 @@ async def _v24_fetch_person_profile(
         if r.get("ok") and r.get("html"):
             html = r.get("html", "")
             final_url = r.get("url") or rec.profile_url
-
-            ai_budget["profile_calls"] = (
-                ai_budget.get("profile_calls", 0) + 1
-            )
 
             ai_rows = await _v24_ai_profile_extract(
                 html,
@@ -15341,7 +15402,7 @@ async def scrape_universal_v24(
     errors: List[Dict],
 ) -> List[PersonRecord]:
     print(
-        "   [V24] Robust scoped deterministic scraper + ScrapeGraphAI fallback",
+        "   [V25] Robust scoped deterministic scraper + bounded ScrapeGraphAI fallback",
         flush=True,
     )
 
@@ -15527,6 +15588,7 @@ async def scrape_universal_v24(
     sem = asyncio.Semaphore(V24_PROFILE_CONCURRENCY)
     ai_budget = {"profile_calls": 0}
 
+    profile_items = list(placeholders.values())[:V23_MAX_PROFILES]
     results = await asyncio.gather(*(
         _v24_fetch_person_profile(
             context,
@@ -15535,11 +15597,21 @@ async def scrape_universal_v24(
             fetch_cache,
             ai_budget,
         )
-        for rec in list(placeholders.values())[:V23_MAX_PROFILES]
-    ))
+        for rec in profile_items
+    ), return_exceptions=True)
 
     profile_rows: List[PersonRecord] = []
-    for rows, diags in results:
+    for rec, result in zip(profile_items, results):
+        if isinstance(result, BaseException):
+            errors.append({
+                "type": "profile_task_exception",
+                "source_url": source_url,
+                "profile_url": rec.profile_url,
+                "name": rec.name,
+                "error": f"{type(result).__name__}: {result}",
+            })
+            continue
+        rows, diags = result
         profile_rows.extend(rows)
         errors.extend(diags)
 
@@ -15576,7 +15648,7 @@ async def scrape_universal_v24(
     errors.append({
         "type": "email_coverage_summary",
         "source_url": source_url,
-        "adapter": "hybrid_v24",
+        "adapter": "hybrid_v25",
         "directory_pages": len(states),
         "person_profiles_discovered": len(placeholders),
         "direct_person_email_rows": len(direct_rows),
@@ -15590,7 +15662,7 @@ async def scrape_universal_v24(
     })
 
     print(
-        f"   [V24 QUALITY] directory_pages={len(states)} "
+        f"   [V25 QUALITY] directory_pages={len(states)} "
         f"profiles={len(placeholders)} "
         f"direct_rows={len(direct_rows)} "
         f"profile_rows={len(profile_rows)} "
@@ -15615,7 +15687,7 @@ async def scrape_source(
 ) -> List[PersonRecord]:
     print(f"\n   [SOURCE] {source_url}", flush=True)
     print(
-        "   [ADAPTER] V24 deterministic + ScrapeGraphAI hybrid",
+        "   [ADAPTER] V25 deterministic + bounded ScrapeGraphAI hybrid",
         flush=True,
     )
 
