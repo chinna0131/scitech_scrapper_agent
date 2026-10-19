@@ -12255,7 +12255,7 @@ def _v21_listing_email_rows(
         local_text = clean_text(block.get_text(" ", strip=True))
         country = extract_country_from_text(local_text)
         if not country:
-            country = country_from_tld(emails[0]) or country_from_url(source_url)
+            country = country_from_tld(emails[0]) or _v22_country_from_url(source_url)
 
         for email in emails:
             if not normalize_email(email):
@@ -12303,7 +12303,7 @@ async def _v21_browser_directory_states(
         await page.goto(
             source_url,
             wait_until="domcontentloaded",
-            timeout=REQUEST_TIMEOUT * 1000,
+            timeout=PLAYWRIGHT_TIMEOUT,
         )
         await page.wait_for_timeout(900)
 
