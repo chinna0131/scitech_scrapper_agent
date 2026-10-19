@@ -2249,34 +2249,105 @@ def validate_record(r: PersonRecord) -> Tuple[bool, str]:
 # =============================================================================
 
 def read_urls() -> List[str]:
+    """
+    Robust urls.xlsx reader.
+
+    Expected workbook:
+        A1 = url
+        A2.. = one URL per row
+
+    Important:
+    - Does NOT depend on ws.max_row/ws.max_column because openpyxl read-only
+      worksheets can report those dimensions as None for some XLSX files.
+    - Rejects real populated values in columns B+.
+    - Ignores completely blank rows.
+    - Accepts a URL embedded in display text/markdown-like cell content.
+    """
     if not INPUT_FILE.exists():
-        raise FileNotFoundError(f"Input file not found: {INPUT_FILE.resolve()}")
-    wb = load_workbook(INPUT_FILE, read_only=True, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-    header = clean_text(ws.cell(1, 1).value).lower()
-    if header != "url":
-        wb.close()
-        raise RuntimeError("Cell A1 must be exactly: url")
+        raise FileNotFoundError(
+            f"Input file not found: {INPUT_FILE.resolve()}"
+        )
 
-    # Strict: reject other populated columns
-    for col in range(2, ws.max_column + 1):
-        for row in range(1, ws.max_row + 1):
-            if clean_text(ws.cell(row, col).value):
-                wb.close()
-                raise RuntimeError("urls.xlsx must contain only one populated column: url")
+    # This file is tiny, so normal mode is safer than streaming/read_only mode
+    # and avoids worksheets with undefined cached dimensions.
+    wb = load_workbook(
+        INPUT_FILE,
+        read_only=False,
+        data_only=True,
+    )
 
-    urls = []
-    for row in range(2, ws.max_row + 1):
-        value = clean_text(ws.cell(row, 1).value)
-        if not value:
-            continue
-        m = re.search(r"https?://[^\s)]+", value)
-        if m:
-            url = m.group(0).rstrip(".,;)>]}")
-            if url not in urls:
+    try:
+        if not wb.sheetnames:
+            raise RuntimeError("urls.xlsx contains no worksheets")
+
+        ws = wb[wb.sheetnames[0]]
+
+        header = clean_text(ws["A1"].value).strip().lower()
+        if header != "url":
+            raise RuntimeError(
+                f"Cell A1 must be exactly: url (found: {ws['A1'].value!r})"
+            )
+
+        urls: List[str] = []
+        seen = set()
+
+        # iter_rows() works even when worksheet dimensions are not cached.
+        for row_number, row in enumerate(
+            ws.iter_rows(min_row=1, values_only=True),
+            start=1,
+        ):
+            if not row:
+                continue
+
+            # Column B onward must have no actual content.
+            extras = [
+                clean_text(value)
+                for value in row[1:]
+                if clean_text(value)
+            ]
+            if extras:
+                raise RuntimeError(
+                    "urls.xlsx must contain only one populated column: url. "
+                    f"Found extra data on row {row_number}: {extras[:3]}"
+                )
+
+            if row_number == 1:
+                continue
+
+            value = clean_text(row[0] if len(row) >= 1 else "")
+            if not value:
+                continue
+
+            # Allow plain URL or URL embedded in markdown/text.
+            m = re.search(
+                r"https?://[^\s<>'\"\]\[)]+",
+                value,
+                flags=re.I,
+            )
+            if not m:
+                print(
+                    f"   [URL INPUT WARNING] Row {row_number} has no valid "
+                    f"http/https URL and was skipped: {value[:120]}",
+                    flush=True,
+                )
+                continue
+
+            url = m.group(0).rstrip(".,;:)>]}")
+            key = normalize_url(url).casefold()
+
+            if key and key not in seen:
+                seen.add(key)
                 urls.append(url)
-    wb.close()
-    return urls
+
+        if not urls:
+            raise RuntimeError(
+                "No valid http/https URLs found in urls.xlsx column A"
+            )
+
+        return urls
+
+    finally:
+        wb.close()
 
 
 def save_excel(records: List[PersonRecord]):
