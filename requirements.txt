@@ -10,3 +10,4 @@ lxml
 pypdf
 pymupdf
 scrapegraphai
+selenium
