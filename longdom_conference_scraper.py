@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
-import json
+import io
 import logging
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -18,13 +18,28 @@ from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 
-DEFAULT_INPUT = "longdom_input.xlsx"
-DEFAULT_OUTPUT = "output/longdom/longdom_conference_abstracts.xlsx"
-DEFAULT_CHECKPOINT = "output/longdom/longdom_checkpoint.csv"
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    import pycountry
+except Exception:
+    pycountry = None
+
+
+DEFAULT_INPUT = "longdom_input_urls.xlsx"
+DEFAULT_OUTPUT = "output/longdom/longdom_authors_emails.xlsx"
+DEFAULT_CHECKPOINT = "output/longdom/longdom_authors_checkpoint.csv"
 
 TIMEOUT = 60
-MAX_WORKERS = 8
+MAX_WORKERS = 6
 REQUEST_DELAY_SECONDS = 0.10
 
 LONGDOM_HOSTS = {
@@ -32,27 +47,43 @@ LONGDOM_HOSTS = {
     "www.longdom.org",
 }
 
-GENERIC_EMAILS = {
-    "info@longdom.org",
-}
-
 EMAIL_RE = re.compile(
     r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
     re.I,
 )
 
-URL_RE = re.compile(
-    r'https?://(?:www\.)?longdom\.org/[^\s<>"\')]+',
-    re.I,
-)
+YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
 
-YEAR_RE = re.compile(
-    r"\b(20\d{2}|19\d{2})\b"
-)
+GENERIC_EMAILS = {
+    "info@longdom.org",
+    "editor@longdom.org",
+    "contact@longdom.org",
+    "support@longdom.org",
+}
 
-DATE_LOCATION_RE = re.compile(
-    r"([A-Za-z]+\s+\d{1,2}(?:-\d{1,2})?,?\s+\d{4})\s*\|\s*(.+)"
-)
+COUNTRY_ALIASES = {
+    "usa": "United States",
+    "u.s.a.": "United States",
+    "u.s.a": "United States",
+    "united states of america": "United States",
+    "us": "United States",
+    "uk": "United Kingdom",
+    "u.k.": "United Kingdom",
+    "uae": "United Arab Emirates",
+    "u.a.e.": "United Arab Emirates",
+    "south korea": "South Korea",
+    "republic of korea": "South Korea",
+    "north korea": "North Korea",
+    "iran": "Iran",
+    "russia": "Russia",
+    "vietnam": "Vietnam",
+    "viet nam": "Vietnam",
+    "czech republic": "Czech Republic",
+    "czechia": "Czech Republic",
+    "taiwan": "Taiwan",
+    "hong kong": "Hong Kong",
+    "palestine": "Palestine",
+}
 
 _thread_local = threading.local()
 
@@ -61,47 +92,30 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-log = logging.getLogger("longdom")
+log = logging.getLogger("longdom_html_pdf")
 
-
-# ============================================================
-# Models
-# ============================================================
 
 @dataclass
 class ListingLink:
     url: str
-    presentation_type: str = ""
     year_hint: str = ""
 
 
 @dataclass
-class ProceedingRecord:
-    presentation_type: str = ""
+class AuthorRecord:
+    author: str = ""
+    email: str = ""
+    affiliation: str = ""
+    country: str = ""
     year: str = ""
 
-    conference_name: str = ""
-    conference_date: str = ""
-    conference_location: str = ""
-
-    title: str = ""
-    author: str = ""
-    affiliation: str = ""
-    email: str = ""
-
-    abstract: str = ""
-    biography: str = ""
-
+    # internal only; removed from final Excel
     listing_url: str = ""
     proceeding_url: str = ""
-
+    pdf_url: str = ""
     status: str = "OK"
     error: str = ""
 
-
-# ============================================================
-# Generic helpers
-# ============================================================
 
 def clean(value: Any) -> str:
     if value is None:
@@ -117,16 +131,30 @@ def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def normalize_url(url: str) -> str:
-    return clean(url).rstrip(".,);]>")
+def normalize_email(value: Any) -> str:
+    value = clean(value)
+
+    if not value:
+        return ""
+
+    match = EMAIL_RE.search(value)
+
+    if not match:
+        return ""
+
+    email = match.group(0).lower().strip(".,;:()[]{}<>")
+
+    if email in GENERIC_EMAILS:
+        return ""
+
+    if email.endswith("@longdom.org"):
+        return ""
+
+    return email
 
 
-def make_session() -> requests.Session:
-    session = getattr(
-        _thread_local,
-        "session",
-        None,
-    )
+def get_session() -> requests.Session:
+    session = getattr(_thread_local, "session", None)
 
     if session is not None:
         return session
@@ -150,14 +178,8 @@ def make_session() -> requests.Session:
         pool_maxsize=20,
     )
 
-    session.mount(
-        "https://",
-        adapter,
-    )
-    session.mount(
-        "http://",
-        adapter,
-    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     session.headers.update(
         {
@@ -175,11 +197,17 @@ def make_session() -> requests.Session:
     return session
 
 
-def get_html(url: str) -> str:
-    session = make_session()
+def get_response(url: str, referer: str = "") -> requests.Response:
+    session = get_session()
+
+    headers = {}
+
+    if referer:
+        headers["Referer"] = referer
 
     response = session.get(
         url,
+        headers=headers,
         timeout=TIMEOUT,
     )
 
@@ -188,60 +216,27 @@ def get_html(url: str) -> str:
             f"HTTP {response.status_code}: {url}"
         )
 
-    if not response.encoding:
-        response.encoding = (
-            response.apparent_encoding
-            or "utf-8"
-        )
+    time.sleep(REQUEST_DELAY_SECONDS)
 
-    time.sleep(
-        REQUEST_DELAY_SECONDS
-    )
+    return response
+
+
+def get_html(url: str, referer: str = "") -> str:
+    response = get_response(url, referer=referer)
+
+    if not response.encoding:
+        response.encoding = response.apparent_encoding or "utf-8"
 
     return response.text
 
 
 # ============================================================
-# Input URL extraction
+# INPUT EXCEL
 # ============================================================
 
-def presentation_type_from_url(
-    url: str,
-) -> str:
-    lower = url.lower()
-
-    if "/keynote/" in lower:
-        return "Keynote"
-
-    if "/scientific-tracks-abstracts/" in lower:
-        return "Scientific Tracks Abstracts"
-
-    if "/posters-accepted-abstracts/" in lower:
-        return "Posters & Accepted Abstracts"
-
-    if "/accepted-abstracts/" in lower:
-        return "Accepted Abstracts"
-
-    if "/posters/" in lower:
-        return "Posters"
-
-    if "/archivejfra/" in lower:
-        if "keynote" in lower:
-            return "Keynote"
-
-        if "tracks" in lower:
-            return "Scientific Tracks Abstracts"
-
-    return "Conference Proceedings"
-
-
-def year_from_text(
-    *values: str,
-) -> str:
+def year_from_text(*values: str) -> str:
     for value in values:
-        match = YEAR_RE.search(
-            clean(value)
-        )
+        match = YEAR_RE.search(clean(value))
 
         if match:
             return match.group(1)
@@ -249,37 +244,10 @@ def year_from_text(
     return ""
 
 
-def extract_listing_urls(
-    input_path: Path,
-) -> list[ListingLink]:
-    """
-    Read Longdom listing URLs from Excel.
-
-    Supported URL columns:
-      url
-      URL
-      link
-      Link
-      source_url
-      listing_url
-
-    If none of those column names exist, the script scans all columns and
-    picks the first column containing Longdom URLs.
-
-    Optional year columns:
-      year
-      Year
-    """
+def read_input_urls(input_path: Path) -> list[ListingLink]:
     if not input_path.exists():
         raise FileNotFoundError(
             f"Input Excel not found: {input_path.resolve()}"
-        )
-
-    suffix = input_path.suffix.lower()
-
-    if suffix not in {".xlsx", ".xls", ".xlsm"}:
-        raise ValueError(
-            "Input file must be an Excel file: .xlsx, .xls, or .xlsm"
         )
 
     df = pd.read_excel(
@@ -288,9 +256,7 @@ def extract_listing_urls(
     ).fillna("")
 
     if df.empty:
-        raise RuntimeError(
-            "Input Excel is empty."
-        )
+        raise RuntimeError("Input Excel is empty.")
 
     normalized_columns = {
         clean(column).casefold(): column
@@ -310,18 +276,12 @@ def extract_listing_urls(
             url_column = normalized_columns[candidate]
             break
 
-    # If no expected header is present, detect the first column that actually
-    # contains Longdom URLs.
     if url_column is None:
         for column in df.columns:
-            values = [
-                clean(value)
-                for value in df[column].tolist()
-            ]
+            values = [clean(x) for x in df[column].tolist()]
 
             if any(
-                value.lower().startswith(("http://", "https://"))
-                and "longdom.org" in value.lower()
+                "longdom.org" in value.lower()
                 for value in values
             ):
                 url_column = column
@@ -329,565 +289,147 @@ def extract_listing_urls(
 
     if url_column is None:
         raise RuntimeError(
-            "Could not find a URL column in the Excel file. "
-            "Recommended header: url"
+            "Could not find URL column. Recommended header: url"
         )
 
     year_column = None
 
-    for candidate in [
-        "year",
-        "years",
-    ]:
-        if candidate in normalized_columns:
-            year_column = normalized_columns[candidate]
-            break
+    if "year" in normalized_columns:
+        year_column = normalized_columns["year"]
 
-    listings: list[ListingLink] = []
+    rows = []
     seen = set()
 
-    for row_no, row in df.iterrows():
-        raw_url = clean(
-            row.get(
-                url_column,
-                "",
-            )
-        )
+    for _, row in df.iterrows():
+        url = clean(row.get(url_column, ""))
 
-        if not raw_url:
+        if not url.startswith(("http://", "https://")):
             continue
 
-        # Excel cells can occasionally contain surrounding text. Extract the
-        # first Longdom URL if needed.
-        if not raw_url.lower().startswith(("http://", "https://")):
-            match = URL_RE.search(
-                raw_url
-            )
-
-            if match:
-                raw_url = match.group(0)
-
-        url = normalize_url(
-            raw_url
-        )
-
-        try:
-            parsed = urlparse(
-                url
-            )
-        except Exception:
-            continue
+        parsed = urlparse(url)
 
         if parsed.netloc.lower() not in LONGDOM_HOSTS:
-            continue
-
-        if "/conference-abstracts/" not in parsed.path.lower():
             continue
 
         if url in seen:
             continue
 
-        seen.add(
-            url
-        )
+        seen.add(url)
 
-        year_hint = ""
+        hint = ""
 
-        if year_column is not None:
-            year_hint = year_from_text(
-                clean(
-                    row.get(
-                        year_column,
-                        "",
-                    )
-                )
-            )
+        if year_column:
+            hint = year_from_text(row.get(year_column, ""))
 
-        if not year_hint:
-            year_hint = year_from_text(
-                url
-            )
+        if not hint:
+            hint = year_from_text(url)
 
-        listings.append(
+        rows.append(
             ListingLink(
                 url=url,
-                presentation_type=presentation_type_from_url(
-                    url
-                ),
-                year_hint=year_hint,
+                year_hint=hint,
             )
         )
 
     log.info(
-        "Excel rows read: %s | valid unique Longdom listing URLs: %s",
+        "Input Excel rows=%s | valid unique Longdom URLs=%s",
         len(df),
-        len(listings),
+        len(rows),
     )
 
-    if not listings:
-        raise RuntimeError(
-            f"No valid Longdom conference URLs were found in column "
-            f"{url_column!r}."
-        )
-
-    return listings
+    return rows
 
 
 # ============================================================
-# Listing page parsing
+# LISTING -> PROCEEDINGS
 # ============================================================
 
-def looks_like_proceeding_url(
-    href: str,
-) -> bool:
-    try:
-        parsed = urlparse(href)
+def is_proceeding_url(url: str) -> bool:
+    parsed = urlparse(url)
 
-        return (
-            parsed.netloc.lower()
-            in LONGDOM_HOSTS
-            and "/proceedings/"
-            in parsed.path.lower()
-            and parsed.path.lower().endswith(
-                ".html"
-            )
-        )
-    except Exception:
-        return False
+    return (
+        parsed.netloc.lower() in LONGDOM_HOSTS
+        and "/proceedings/" in parsed.path.lower()
+        and parsed.path.lower().endswith(".html")
+    )
 
 
-def parse_listing_page(
+def discover_proceedings(
     listing: ListingLink,
-    html: str,
 ) -> list[str]:
-    soup = BeautifulSoup(
-        html,
-        "lxml",
-    )
+    html = get_html(listing.url)
 
-    links = []
+    soup = BeautifulSoup(html, "lxml")
+
+    found = []
     seen = set()
 
-    for anchor in soup.select(
-        "a[href]"
-    ):
-        href = normalize_url(
-            urljoin(
-                listing.url,
-                anchor.get("href", ""),
-            )
+    for anchor in soup.select("a[href]"):
+        href = urljoin(
+            listing.url,
+            clean(anchor.get("href")),
         )
 
-        if not looks_like_proceeding_url(
-            href
-        ):
+        if not is_proceeding_url(href):
             continue
 
         if href in seen:
             continue
 
         seen.add(href)
-        links.append(href)
+        found.append(href)
 
     log.info(
-        "LISTING | %s | proceeding links=%s",
+        "DISCOVER | %s | proceedings=%s",
         listing.url,
-        len(links),
+        len(found),
     )
 
-    return links
+    return found
 
 
 # ============================================================
-# Detail page extraction
+# HTML EXTRACTION
 # ============================================================
 
-def main_content(
+def extract_pdf_url(
     soup: BeautifulSoup,
-) -> Tag:
-    for selector in [
-        "main",
-        "#main-content",
-        ".main-content",
-        ".content",
-        "#content",
-        "body",
-    ]:
-        node = soup.select_one(
-            selector
-        )
-
-        if node:
-            return node
-
-    return soup
-
-
-def extract_person_email(
-    content: Tag,
+    proceeding_url: str,
 ) -> str:
-    candidates = []
-
-    for anchor in content.select(
-        'a[href^="mailto:"]'
-    ):
-        href = clean(
-            anchor.get("href")
-        )
-
-        match = EMAIL_RE.search(
-            href
-        )
-
-        if match:
-            candidates.append(
-                match.group(0).lower()
-            )
-
-    for match in EMAIL_RE.findall(
-        content.get_text(
-            " ",
-            strip=True,
-        )
-    ):
-        candidates.append(
-            match.lower()
-        )
-
-    for email in candidates:
-        if email in GENERIC_EMAILS:
-            continue
-
-        if email.endswith(
-            "@longdom.org"
-        ):
-            continue
-
-        return email
-
-    return ""
-
-
-def text_after_heading(
-    soup: BeautifulSoup,
-    heading_texts: tuple[str, ...],
-    *,
-    stop_headings: tuple[str, ...] = (),
-) -> str:
-    """
-    Collect text after a heading like 'Abstract :' until the next heading.
-    """
-    for heading in soup.find_all(
-        ["h2", "h3", "h4", "h5", "h6", "strong"]
-    ):
-        label = clean(
-            heading.get_text(
-                " ",
-                strip=True,
-            )
+    # Prefer anchor whose visible text is PDF.
+    for anchor in soup.select("a[href]"):
+        text = clean(
+            anchor.get_text(" ", strip=True)
         ).casefold()
 
-        if not any(
-            target.casefold() in label
-            for target in heading_texts
-        ):
+        href = clean(anchor.get("href"))
+
+        if not href:
             continue
 
-        parts = []
-
-        node = heading.find_next_sibling()
-
-        while node:
-            if isinstance(
-                node,
-                Tag,
-            ) and node.name in {
-                "h2",
-                "h3",
-                "h4",
-                "h5",
-                "h6",
-            }:
-                next_label = clean(
-                    node.get_text(
-                        " ",
-                        strip=True,
-                    )
-                ).casefold()
-
-                if (
-                    not stop_headings
-                    or any(
-                        stop.casefold()
-                        in next_label
-                        for stop
-                        in stop_headings
-                    )
-                    or True
-                ):
-                    break
-
-            if isinstance(
-                node,
-                Tag,
-            ):
-                text = clean(
-                    node.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                if text:
-                    parts.append(
-                        text
-                    )
-
-            node = node.find_next_sibling()
-
-        return clean(
-            " ".join(
-                parts
-            )
+        absolute = urljoin(
+            proceeding_url,
+            href,
         )
+
+        if text == "pdf" or absolute.lower().endswith(".pdf"):
+            return absolute
 
     return ""
 
 
-def heading_candidates(
+def extract_author_affiliation_from_html(
     soup: BeautifulSoup,
-) -> list[str]:
-    output = []
-
-    for node in soup.find_all(
-        ["h1", "h2", "h3", "h4"]
-    ):
-        text = clean(
-            node.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        if text and text not in output:
-            output.append(text)
-
-    return output
-
-
-def parse_date_location(
-    text: str,
-) -> tuple[str, str]:
-    text = clean(text)
-
-    match = DATE_LOCATION_RE.search(
-        text
-    )
-
-    if not match:
-        return "", ""
-
-    return (
-        clean(
-            match.group(1)
-        ),
-        clean(
-            match.group(2)
-        ),
-    )
-
-
-def extract_conference_metadata(
-    soup: BeautifulSoup,
-    listing: ListingLink,
-) -> tuple[
-    str,
-    str,
-    str,
-    str,
-]:
-    """
-    Returns:
-      conference_name, date, location, year
-    """
-    headings = heading_candidates(
-        soup
-    )
-
-    conference_name = ""
-    conference_date = ""
-    conference_location = ""
-
-    # On Longdom proceedings pages, conference name is commonly directly
-    # under the abstract title as h4/h3 text and date|location follows it.
-    for node in soup.find_all(
-        ["h3", "h4"]
-    ):
-        text = clean(
-            node.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        lower = text.casefold()
-
-        if (
-            "conference"
-            in lower
-            or "congress"
-            in lower
-            or "summit"
-            in lower
-        ):
-            conference_name = text
-
-            sibling = node.find_next_sibling()
-
-            for _ in range(5):
-                if sibling is None:
-                    break
-
-                if isinstance(
-                    sibling,
-                    Tag,
-                ):
-                    sibling_text = clean(
-                        sibling.get_text(
-                            " ",
-                            strip=True,
-                        )
-                    )
-
-                    date, location = parse_date_location(
-                        sibling_text
-                    )
-
-                    if date or location:
-                        conference_date = date
-                        conference_location = location
-                        break
-
-                sibling = sibling.find_next_sibling()
-
-            if conference_name:
-                break
-
-    # Fallback: scan visible text for a Date | Location line.
-    if not conference_date:
-        body_text = soup.get_text(
-            "\n",
-            strip=True,
-        )
-
-        for line in body_text.splitlines():
-            date, location = parse_date_location(
-                line
-            )
-
-            if date:
-                conference_date = date
-                conference_location = location
-                break
-
-    year = year_from_text(
-        conference_date,
-        listing.year_hint,
-        listing.url,
-    )
-
-    return (
-        conference_name,
-        conference_date,
-        conference_location,
-        year,
-    )
-
-
-def extract_title(
-    soup: BeautifulSoup,
-) -> str:
-    # Longdom proceeding title is typically the first main h2.
-    candidates = []
-
-    for selector in [
-        "h2",
-        "h1",
-    ]:
-        for node in soup.select(
-            selector
-        ):
-            text = clean(
-                node.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            lower = text.casefold()
-
-            if not text:
-                continue
-
-            if "international journal" in lower:
-                continue
-
-            if (
-                "conference"
-                in lower
-                and len(text) < 180
-            ):
-                continue
-
-            candidates.append(
-                text
-            )
-
-    return (
-        candidates[0]
-        if candidates
-        else ""
-    )
-
-
-def is_noise_line(
-    text: str,
-) -> bool:
-    lower = clean(text).casefold()
-
-    noise = [
-        "open access",
-        "abstract",
-        "biography",
-        "content links",
-        "contact longdom",
-        "international journal",
-        "instructions for authors",
-        "journal home",
-        "submit manuscript",
-    ]
-
-    return any(
-        token in lower
-        for token in noise
-    )
-
-
-def extract_author_affiliation(
-    soup: BeautifulSoup,
-    title: str,
-    conference_name: str,
 ) -> tuple[str, str]:
     """
-    Longdom structure observed:
-        <h2>Abstract title</h2>
-        <h4>Conference name</h4>
+    Longdom proceeding HTML commonly has:
+        title
+        conference
         date/location
-        Author
-        Affiliation
-        ...
-        Abstract :
-    We collect text blocks between the date/location and Abstract heading.
+        AUTHOR
+        AFFILIATION
+        Keynote:/Scientific Tracks...
+        Abstract:
     """
     abstract_heading = None
 
@@ -895,249 +437,487 @@ def extract_author_affiliation(
         ["h4", "h5", "h6", "strong"]
     ):
         text = clean(
-            node.get_text(
-                " ",
-                strip=True,
-            )
+            node.get_text(" ", strip=True)
         ).casefold()
 
-        if text.startswith(
-            "abstract"
-        ):
+        if text.startswith("abstract"):
             abstract_heading = node
             break
 
     if abstract_heading:
         previous = []
-
         node = abstract_heading.previous_sibling
 
-        while node and len(
-            previous
-        ) < 12:
-            if isinstance(
-                node,
-                Tag,
-            ):
-                text = clean(
-                    node.get_text(
-                        " ",
-                        strip=True,
-                    )
+        while node and len(previous) < 18:
+            if isinstance(node, Tag):
+                value = clean(
+                    node.get_text(" ", strip=True)
                 )
 
-                if (
-                    text
-                    and text != title
-                    and text != conference_name
-                    and not is_noise_line(
-                        text
-                    )
-                ):
-                    previous.append(
-                        text
-                    )
+                if value:
+                    previous.append(value)
 
             node = node.previous_sibling
 
         previous.reverse()
 
-        # Remove date/location, journal/category text, HTML/PDF labels.
         candidates = []
 
-        for text in previous:
-            lower = text.casefold()
+        for value in previous:
+            lower = value.casefold()
 
-            if parse_date_location(
-                text
-            )[0]:
+            if not value:
                 continue
 
-            if lower in {
-                "html",
-                "pdf",
-            }:
+            if lower in {"html", "pdf"}:
                 continue
 
-            if (
-                "scientific tracks abstracts:"
-                in lower
-                or "keynote:"
-                in lower
-                or "posters"
-                in lower
+            if lower.startswith(
+                (
+                    "keynote:",
+                    "scientific tracks abstracts:",
+                    "posters:",
+                    "accepted abstracts:",
+                )
             ):
                 continue
 
-            candidates.append(
-                text
-            )
+            if "conference" in lower and len(value) < 200:
+                continue
 
-        if candidates:
-            author = candidates[-2] if len(
-                candidates
-            ) >= 2 else candidates[0]
-
-            affiliation = candidates[-1] if len(
-                candidates
-            ) >= 2 else ""
-
-            # If last value is short person-name-like text, switch.
-            if (
-                affiliation
-                and len(
-                    affiliation.split()
-                )
-                <= 7
-                and "," not in affiliation
-                and len(
-                    author.split()
-                )
-                > 7
+            if re.search(
+                r"[A-Za-z]+\s+\d{1,2}(?:-\d{1,2})?,?\s+\d{4}\s*\|",
+                value,
             ):
-                author, affiliation = (
-                    affiliation,
-                    author,
-                )
+                continue
 
+            candidates.append(value)
+
+        # The last two meaningful blocks before category/Abstract are usually
+        # author and affiliation.
+        if len(candidates) >= 2:
             return (
-                clean(author),
-                clean(affiliation),
+                clean(candidates[-2]),
+                clean(candidates[-1]),
             )
+
+    # Fallback based on the body line sequence around Abstract.
+    lines = [
+        clean(line)
+        for line in soup.get_text("\n", strip=True).splitlines()
+        if clean(line)
+    ]
+
+    abstract_idx = None
+
+    for i, line in enumerate(lines):
+        if line.casefold().startswith("abstract"):
+            abstract_idx = i
+            break
+
+    if abstract_idx is not None:
+        before = lines[max(0, abstract_idx - 12):abstract_idx]
+
+        filtered = []
+
+        for value in before:
+            lower = value.casefold()
+
+            if lower in {"pdf", "html"}:
+                continue
+
+            if lower.startswith(
+                (
+                    "keynote:",
+                    "scientific tracks abstracts:",
+                    "posters:",
+                    "accepted abstracts:",
+                )
+            ):
+                continue
+
+            if "conference" in lower and len(value) < 200:
+                continue
+
+            if " | " in value and YEAR_RE.search(value):
+                continue
+
+            filtered.append(value)
+
+        if len(filtered) >= 2:
+            return clean(filtered[-2]), clean(filtered[-1])
 
     return "", ""
 
 
-def parse_proceeding(
-    listing: ListingLink,
-    proceeding_url: str,
-    html: str,
-) -> ProceedingRecord:
-    soup = BeautifulSoup(
-        html,
-        "lxml",
-    )
-
-    content = main_content(
-        soup
-    )
-
-    title = extract_title(
-        soup
-    )
-
-    (
-        conference_name,
-        conference_date,
-        conference_location,
-        year,
-    ) = extract_conference_metadata(
-        soup,
-        listing,
-    )
-
-    author, affiliation = (
-        extract_author_affiliation(
-            soup,
-            title,
-            conference_name,
-        )
-    )
-
-    abstract = text_after_heading(
-        soup,
-        (
-            "Abstract",
-        ),
-    )
-
-    biography = text_after_heading(
-        soup,
-        (
-            "Biography",
-            "Bio",
-        ),
-    )
-
-    # If generic heading collector did not work because paragraphs are nested,
-    # use text boundaries as a fallback.
-    if not abstract:
-        full_text = content.get_text(
-            "\n",
-            strip=True,
+def extract_email_from_html(
+    soup: BeautifulSoup,
+) -> str:
+    for anchor in soup.select('a[href^="mailto:"]'):
+        email = normalize_email(
+            anchor.get("href")
         )
 
-        match = re.search(
-            r"\bAbstract\s*:?\s*(.+?)(?=\bBiography\s*:|\bContent Links\b|\Z)",
-            full_text,
-            re.I | re.S,
-        )
+        if email:
+            return email
 
-        if match:
-            abstract = clean(
-                match.group(1)
-            )
+    for email in EMAIL_RE.findall(
+        soup.get_text(" ", strip=True)
+    ):
+        email = normalize_email(email)
 
-    if not biography:
-        full_text = content.get_text(
-            "\n",
-            strip=True,
-        )
+        if email:
+            return email
 
-        match = re.search(
-            r"\bBiography\s*:?\s*(.+?)(?=\bContent Links\b|\bContact Longdom\b|\Z)",
-            full_text,
-            re.I | re.S,
-        )
-
-        if match:
-            biography = clean(
-                match.group(1)
-            )
-
-    return ProceedingRecord(
-        presentation_type=listing.presentation_type,
-        year=year,
-        conference_name=conference_name,
-        conference_date=conference_date,
-        conference_location=conference_location,
-        title=title,
-        author=author,
-        affiliation=affiliation,
-        email=extract_person_email(
-            content
-        ),
-        abstract=abstract,
-        biography=biography,
-        listing_url=listing.url,
-        proceeding_url=proceeding_url,
-        status="OK",
-        error="",
-    )
+    return ""
 
 
 # ============================================================
-# Worker / checkpoint
+# PDF DOWNLOAD + EXTRACTION
 # ============================================================
 
-def scrape_one(
+def extract_pdf_text(
+    pdf_bytes: bytes,
+) -> str:
+    if not pdf_bytes:
+        return ""
+
+    if fitz is not None:
+        try:
+            document = fitz.open(
+                stream=pdf_bytes,
+                filetype="pdf",
+            )
+
+            pages = []
+
+            for page in document:
+                pages.append(
+                    page.get_text("text")
+                )
+
+            document.close()
+
+            text = "\n".join(pages)
+
+            if clean(text):
+                return text
+
+        except Exception as exc:
+            log.debug(
+                "PyMuPDF extraction failed: %s",
+                exc,
+            )
+
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(
+                io.BytesIO(pdf_bytes)
+            )
+
+            return "\n".join(
+                page.extract_text() or ""
+                for page in reader.pages
+            )
+
+        except Exception as exc:
+            log.debug(
+                "pypdf extraction failed: %s",
+                exc,
+            )
+
+    return ""
+
+
+def download_pdf(
+    pdf_url: str,
+    proceeding_url: str,
+) -> bytes:
+    response = get_response(
+        pdf_url,
+        referer=proceeding_url,
+    )
+
+    content_type = response.headers.get(
+        "Content-Type",
+        "",
+    ).lower()
+
+    if (
+        "pdf" not in content_type
+        and not response.content.startswith(b"%PDF")
+    ):
+        raise RuntimeError(
+            f"PDF link returned non-PDF content: {pdf_url}"
+        )
+
+    return response.content
+
+
+def extract_email_from_pdf_text(
+    pdf_text: str,
+) -> str:
+    if not pdf_text:
+        return ""
+
+    # Longdom PDFs frequently format correspondence as:
+    #   e: person@example.com
+    # Give that highest priority.
+    patterns = [
+        r"\be\s*:\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+        r"\bemail\s*:\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+        r"\be-mail\s*:\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+        EMAIL_RE.pattern,
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            pdf_text,
+            re.I,
+        )
+
+        if not match:
+            continue
+
+        value = (
+            match.group(1)
+            if match.lastindex
+            else match.group(0)
+        )
+
+        email = normalize_email(value)
+
+        if email:
+            return email
+
+    return ""
+
+
+def extract_author_affiliation_from_pdf(
+    pdf_text: str,
+    author_html: str,
+    affiliation_html: str,
+) -> tuple[str, str]:
+    """
+    PDF footer commonly contains:
+        e: email@example.com
+        Author Name
+        University Name, USA
+    """
+    author = clean(author_html)
+    affiliation = clean(affiliation_html)
+
+    if not pdf_text:
+        return author, affiliation
+
+    lines = [
+        clean(line)
+        for line in pdf_text.splitlines()
+        if clean(line)
+    ]
+
+    email_line_index = None
+
+    for i, line in enumerate(lines):
+        if EMAIL_RE.search(line):
+            email_line_index = i
+            break
+
+    if email_line_index is not None:
+        after = lines[
+            email_line_index + 1:
+            email_line_index + 5
+        ]
+
+        if not author and after:
+            candidate = after[0]
+
+            if len(candidate) < 150:
+                author = candidate
+
+        if not affiliation and len(after) >= 2:
+            candidate = after[1]
+
+            if len(candidate) < 300:
+                affiliation = candidate
+
+    return author, affiliation
+
+
+# ============================================================
+# COUNTRY
+# ============================================================
+
+def build_country_names() -> list[tuple[str, str]]:
+    values: dict[str, str] = {}
+
+    for alias, canonical in COUNTRY_ALIASES.items():
+        values[alias.casefold()] = canonical
+
+    if pycountry is not None:
+        for item in pycountry.countries:
+            name = clean(getattr(item, "name", ""))
+
+            if name:
+                values[name.casefold()] = name
+
+            official = clean(
+                getattr(item, "official_name", "")
+            )
+
+            if official:
+                values[official.casefold()] = name or official
+
+            common = clean(
+                getattr(item, "common_name", "")
+            )
+
+            if common:
+                values[common.casefold()] = name or common
+
+    # longest first prevents "Korea"-like partial matches if aliases overlap
+    return sorted(
+        values.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+
+COUNTRY_NAMES = build_country_names()
+
+
+def extract_country(
+    affiliation: str,
+    pdf_text: str = "",
+) -> str:
+    # Prefer affiliation, because conference location must not be mistaken for
+    # the author's country.
+    for source in [affiliation, pdf_text]:
+        text = clean(source)
+
+        if not text:
+            continue
+
+        lower = text.casefold()
+
+        # First check final comma-separated segment.
+        final_segment = clean(
+            text.rsplit(",", 1)[-1]
+        ).casefold()
+
+        for needle, canonical in COUNTRY_NAMES:
+            if final_segment == needle:
+                return canonical
+
+        # Then search as a whole-word-ish phrase.
+        for needle, canonical in COUNTRY_NAMES:
+            if re.search(
+                r"(?<![A-Za-z])"
+                + re.escape(needle)
+                + r"(?![A-Za-z])",
+                lower,
+                re.I,
+            ):
+                return canonical
+
+    return ""
+
+
+# ============================================================
+# PROCEEDING SCRAPE
+# ============================================================
+
+def scrape_proceeding(
     listing: ListingLink,
     proceeding_url: str,
-) -> ProceedingRecord:
+) -> AuthorRecord:
     try:
         html = get_html(
-            proceeding_url
+            proceeding_url,
+            referer=listing.url,
         )
 
-        return parse_proceeding(
-            listing,
-            proceeding_url,
+        soup = BeautifulSoup(
             html,
+            "lxml",
+        )
+
+        author, affiliation = (
+            extract_author_affiliation_from_html(
+                soup
+            )
+        )
+
+        email = extract_email_from_html(
+            soup
+        )
+
+        pdf_url = extract_pdf_url(
+            soup,
+            proceeding_url,
+        )
+
+        pdf_text = ""
+
+        if pdf_url:
+            try:
+                pdf_bytes = download_pdf(
+                    pdf_url,
+                    proceeding_url,
+                )
+
+                pdf_text = extract_pdf_text(
+                    pdf_bytes
+                )
+
+                if not email:
+                    email = extract_email_from_pdf_text(
+                        pdf_text
+                    )
+
+                author, affiliation = (
+                    extract_author_affiliation_from_pdf(
+                        pdf_text,
+                        author,
+                        affiliation,
+                    )
+                )
+
+            except Exception as pdf_exc:
+                log.warning(
+                    "PDF failed | %s | %s",
+                    pdf_url,
+                    pdf_exc,
+                )
+
+        year = year_from_text(
+            listing.year_hint,
+            proceeding_url,
+            pdf_text,
+            soup.get_text(" ", strip=True),
+        )
+
+        country = extract_country(
+            affiliation,
+            pdf_text,
+        )
+
+        return AuthorRecord(
+            author=clean(author),
+            email=clean(email),
+            affiliation=clean(affiliation),
+            country=clean(country),
+            year=clean(year),
+            listing_url=listing.url,
+            proceeding_url=proceeding_url,
+            pdf_url=pdf_url,
+            status="OK",
+            error="",
         )
 
     except Exception as exc:
-        return ProceedingRecord(
-            presentation_type=listing.presentation_type,
+        return AuthorRecord(
             year=listing.year_hint,
             listing_url=listing.url,
             proceeding_url=proceeding_url,
@@ -1146,14 +926,12 @@ def scrape_one(
         )
 
 
-def checkpoint_columns() -> list[str]:
-    return list(
-        ProceedingRecord.__dataclass_fields__.keys()
-    )
-
+# ============================================================
+# CHECKPOINT
+# ============================================================
 
 def save_checkpoint(
-    records: list[ProceedingRecord],
+    records: list[AuthorRecord],
     path: Path,
 ) -> None:
     path.parent.mkdir(
@@ -1162,11 +940,7 @@ def save_checkpoint(
     )
 
     pd.DataFrame(
-        [
-            asdict(record)
-            for record in records
-        ],
-        columns=checkpoint_columns(),
+        [asdict(x) for x in records]
     ).to_csv(
         path,
         index=False,
@@ -1176,7 +950,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path,
-) -> dict[str, ProceedingRecord]:
+) -> dict[str, AuthorRecord]:
     if not path.exists():
         return {}
 
@@ -1187,37 +961,28 @@ def load_checkpoint(
             keep_default_na=False,
         )
 
-        output = {}
-
         fields = set(
-            checkpoint_columns()
+            AuthorRecord.__dataclass_fields__.keys()
         )
 
-        for row in df.to_dict(
-            orient="records"
-        ):
+        output = {}
+
+        for row in df.to_dict(orient="records"):
             payload = {
-                key: row.get(
-                    key,
-                    "",
-                )
-                for key in fields
+                field: row.get(field, "")
+                for field in fields
             }
 
-            record = ProceedingRecord(
-                **payload
-            )
+            record = AuthorRecord(**payload)
 
             if record.proceeding_url:
-                output[
-                    record.proceeding_url
-                ] = record
+                output[record.proceeding_url] = record
 
         return output
 
     except Exception as exc:
         log.warning(
-            "Could not load checkpoint: %s",
+            "Checkpoint load failed: %s",
             exc,
         )
 
@@ -1225,218 +990,111 @@ def load_checkpoint(
 
 
 # ============================================================
-# Excel export
+# FINAL EXCEL - ONLY 5 COLUMNS
 # ============================================================
 
-def write_sheet(
-    writer: pd.ExcelWriter,
-    df: pd.DataFrame,
-    name: str,
-) -> None:
-    df.to_excel(
-        writer,
-        sheet_name=name,
-        index=False,
-    )
-
-    ws = writer.sheets[
-        name
-    ]
-
-    ws.freeze_panes = "A2"
-
-    if ws.max_row >= 1:
-        ws.auto_filter.ref = (
-            ws.dimensions
-        )
-
-    for column_cells in ws.columns:
-        letter = column_cells[
-            0
-        ].column_letter
-
-        max_length = 0
-
-        for cell in column_cells[
-            :500
-        ]:
-            max_length = max(
-                max_length,
-                len(
-                    clean(
-                        cell.value
-                    )
-                ),
-            )
-
-        ws.column_dimensions[
-            letter
-        ].width = min(
-            max(
-                max_length + 2,
-                12,
-            ),
-            70,
-        )
-
-
 def export_excel(
-    records: list[ProceedingRecord],
-    listings: list[ListingLink],
-    output: Path,
+    records: list[AuthorRecord],
+    output_path: Path,
 ) -> None:
-    output.parent.mkdir(
+    output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    rows = [
+        {
+            "author": clean(record.author),
+            "email": clean(record.email),
+            "affiliation": clean(record.affiliation),
+            "country": clean(record.country),
+            "year": clean(record.year),
+        }
+        for record in records
+        if record.status == "OK"
+    ]
+
     df = pd.DataFrame(
-        [
-            asdict(record)
-            for record in records
+        rows,
+        columns=[
+            "author",
+            "email",
+            "affiliation",
+            "country",
+            "year",
         ],
-        columns=checkpoint_columns(),
     )
 
     if not df.empty:
+        # Remove exact duplicate proceeding-derived people.
+        df = df.drop_duplicates(
+            subset=[
+                "author",
+                "email",
+                "affiliation",
+                "year",
+            ],
+            keep="first",
+        )
+
         df = df.sort_values(
             by=[
                 "year",
-                "presentation_type",
                 "author",
-                "title",
             ],
             ascending=[
                 False,
                 True,
-                True,
-                True,
             ],
             na_position="last",
-        ).reset_index(
-            drop=True
-        )
-
-    errors_df = (
-        df[
-            df["status"] == "ERROR"
-        ].copy()
-        if not df.empty
-        else pd.DataFrame(
-            columns=checkpoint_columns()
-        )
-    )
-
-    email_df = (
-        df[
-            df["email"]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            != ""
-        ].copy()
-        if not df.empty
-        else pd.DataFrame(
-            columns=checkpoint_columns()
-        )
-    )
-
-    listings_df = pd.DataFrame(
-        [
-            {
-                "listing_url": item.url,
-                "presentation_type": item.presentation_type,
-                "year_hint": item.year_hint,
-            }
-            for item in listings
-        ]
-    )
-
-    summary_df = pd.DataFrame(
-        [
-            {
-                "metric": "Input listing URLs",
-                "value": len(
-                    listings
-                ),
-            },
-            {
-                "metric": "Proceedings records",
-                "value": len(
-                    records
-                ),
-            },
-            {
-                "metric": "Records with published person email",
-                "value": len(
-                    email_df
-                ),
-            },
-            {
-                "metric": "Errors",
-                "value": len(
-                    errors_df
-                ),
-            },
-        ]
-    )
+        ).reset_index(drop=True)
 
     with pd.ExcelWriter(
-        output,
+        output_path,
         engine="openpyxl",
     ) as writer:
-        write_sheet(
+        df.to_excel(
             writer,
-            df,
-            "Proceedings",
+            sheet_name="Authors",
+            index=False,
         )
 
-        write_sheet(
-            writer,
-            email_df,
-            "With Emails",
-        )
+        ws = writer.sheets["Authors"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
 
-        write_sheet(
-            writer,
-            listings_df,
-            "Input Listings",
-        )
+        widths = {
+            "A": 35,
+            "B": 40,
+            "C": 70,
+            "D": 25,
+            "E": 12,
+        }
 
-        write_sheet(
-            writer,
-            errors_df,
-            "Errors",
-        )
-
-        write_sheet(
-            writer,
-            summary_df,
-            "Summary",
-        )
+        for column, width in widths.items():
+            ws.column_dimensions[column].width = width
 
     log.info(
         "Excel saved: %s",
-        output.resolve(),
+        output_path.resolve(),
     )
 
 
 # ============================================================
-# Main
+# MAIN
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Scrape Longdom conference listing URLs from an Excel file, "
-            "follow each /proceedings/ abstract page, and export structured data to Excel."
+            "Scrape Longdom conference proceedings using both HTML and PDF. "
+            "Final Excel columns: author, email, affiliation, country, year."
         )
     )
 
     parser.add_argument(
         "--input",
         default=DEFAULT_INPUT,
-        help="Excel file containing Longdom conference listing URLs. Recommended column: url",
     )
 
     parser.add_argument(
@@ -1459,117 +1117,57 @@ def main():
         "--limit-listings",
         type=int,
         default=0,
-        help="Process only first N listing URLs for testing; 0 = all.",
     )
 
     parser.add_argument(
         "--limit-proceedings",
         type=int,
         default=0,
-        help="Process only first N unique proceedings for testing; 0 = all.",
     )
 
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Ignore checkpoint and re-scrape proceedings.",
     )
 
     args = parser.parse_args()
 
-    input_path = Path(
-        args.input
-    )
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    checkpoint_path = Path(args.checkpoint)
 
-    output_path = Path(
-        args.output
-    )
-
-    checkpoint_path = Path(
-        args.checkpoint
-    )
-
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"Input file not found: {input_path.resolve()}"
-        )
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    checkpoint_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    listings = extract_listing_urls(
+    listings = read_input_urls(
         input_path
     )
 
     if args.limit_listings > 0:
-        listings = listings[
-            : args.limit_listings
-        ]
+        listings = listings[:args.limit_listings]
 
-    if not listings:
-        raise RuntimeError(
-            "No Longdom /conference-abstracts/ URLs were found in the input Excel file."
-        )
-
-    log.info(
-        "Unique conference listing URLs: %s",
-        len(listings),
-    )
-
-    # Discover all proceeding URLs.
-    proceeding_jobs: list[
-        tuple[
-            ListingLink,
-            str,
-        ]
-    ] = []
-
-    seen_proceedings = set()
+    jobs: list[tuple[ListingLink, str]] = []
+    seen = set()
 
     for index, listing in enumerate(
         listings,
         start=1,
     ):
         log.info(
-            "DISCOVER [%s/%s] %s",
+            "LISTING [%s/%s] %s",
             index,
-            len(
-                listings
-            ),
+            len(listings),
             listing.url,
         )
 
         try:
-            html = get_html(
-                listing.url
-            )
-
-            urls = parse_listing_page(
-                listing,
-                html,
+            urls = discover_proceedings(
+                listing
             )
 
             for url in urls:
-                if url in seen_proceedings:
+                if url in seen:
                     continue
 
-                seen_proceedings.add(
-                    url
-                )
-
-                proceeding_jobs.append(
-                    (
-                        listing,
-                        url,
-                    )
-                )
+                seen.add(url)
+                jobs.append((listing, url))
 
         except Exception as exc:
             log.error(
@@ -1579,37 +1177,30 @@ def main():
             )
 
     if args.limit_proceedings > 0:
-        proceeding_jobs = proceeding_jobs[
-            : args.limit_proceedings
-        ]
+        jobs = jobs[:args.limit_proceedings]
 
     log.info(
         "Unique proceedings discovered: %s",
-        len(proceeding_jobs),
+        len(jobs),
     )
 
-    if not proceeding_jobs:
+    if not jobs:
         raise RuntimeError(
-            "No /proceedings/ abstract links were discovered from the supplied listing URLs."
+            "No proceeding pages were discovered."
         )
 
     completed = (
         {}
         if args.fresh
-        else load_checkpoint(
-            checkpoint_path
-        )
+        else load_checkpoint(checkpoint_path)
     )
 
     pending = [
         job
-        for job in proceeding_jobs
+        for job in jobs
         if (
             job[1] not in completed
-            or completed[
-                job[1]
-            ].status
-            == "ERROR"
+            or completed[job[1]].status == "ERROR"
         )
     ]
 
@@ -1620,80 +1211,46 @@ def main():
 
     workers = max(
         1,
-        min(
-            int(
-                args.workers
-            ),
-            20,
-        ),
+        min(args.workers, 12),
     )
 
     if pending:
         with cf.ThreadPoolExecutor(
             max_workers=workers
         ) as executor:
-            futures = {
+            future_map = {
                 executor.submit(
-                    scrape_one,
+                    scrape_proceeding,
                     listing,
-                    proceeding_url,
-                ): (
-                    listing,
-                    proceeding_url,
-                )
-                for (
-                    listing,
-                    proceeding_url,
-                ) in pending
+                    url,
+                ): (listing, url)
+                for listing, url in pending
             }
 
             processed = 0
 
-            for future in cf.as_completed(
-                futures
-            ):
-                (
-                    listing,
-                    proceeding_url,
-                ) = futures[
-                    future
-                ]
+            for future in cf.as_completed(future_map):
+                listing, url = future_map[future]
 
                 record = future.result()
-
-                completed[
-                    proceeding_url
-                ] = record
+                completed[url] = record
 
                 processed += 1
 
                 log.info(
-                    "[%s/%s] %s | %s | %s",
+                    "[%s/%s] %s | %s | %s | %s",
                     processed,
-                    len(
-                        pending
-                    ),
-                    record.author
-                    or "NO AUTHOR",
-                    record.title[
-                        :90
-                    ]
-                    or proceeding_url,
+                    len(pending),
+                    record.author or "NO AUTHOR",
+                    record.email or "NO EMAIL",
+                    record.country or "NO COUNTRY",
                     record.status,
                 )
 
-                if (
-                    processed % 25
-                    == 0
-                ):
+                if processed % 20 == 0:
                     ordered = [
-                        completed[
-                            url
-                        ]
-                        for (
-                            _listing,
-                            url,
-                        ) in proceeding_jobs
+                        completed[url]
+                        for _, url in jobs
                         if url in completed
                     ]
 
@@ -1704,20 +1261,16 @@ def main():
 
     final_records = [
         completed.get(
-            proceeding_url,
-            ProceedingRecord(
-                presentation_type=listing.presentation_type,
+            url,
+            AuthorRecord(
                 year=listing.year_hint,
                 listing_url=listing.url,
-                proceeding_url=proceeding_url,
+                proceeding_url=url,
                 status="ERROR",
-                error="Proceeding was not processed.",
+                error="Not processed",
             ),
         )
-        for (
-            listing,
-            proceeding_url,
-        ) in proceeding_jobs
+        for listing, url in jobs
     ]
 
     save_checkpoint(
@@ -1727,48 +1280,31 @@ def main():
 
     export_excel(
         final_records,
-        listings,
         output_path,
     )
 
-    with_email = sum(
-        bool(
-            record.email
-        )
-        for record in final_records
-    )
+    ok_records = [
+        r
+        for r in final_records
+        if r.status == "OK"
+    ]
 
-    errors = sum(
-        record.status
-        == "ERROR"
-        for record in final_records
+    with_email = sum(
+        bool(r.email)
+        for r in ok_records
     )
 
     print()
-    print("=" * 78)
-    print(
-        "LONGDOM CONFERENCE SCRAPE COMPLETE"
-    )
-    print("=" * 78)
-    print(
-        f"Input listings       : {len(listings)}"
-    )
-    print(
-        f"Proceedings          : {len(final_records)}"
-    )
-    print(
-        f"With person email    : {with_email}"
-    )
-    print(
-        f"Errors               : {errors}"
-    )
-    print(
-        f"Checkpoint           : {checkpoint_path.resolve()}"
-    )
-    print(
-        f"Excel                : {output_path.resolve()}"
-    )
-    print("=" * 78)
+    print("=" * 72)
+    print("LONGDOM HTML + PDF SCRAPE COMPLETE")
+    print("=" * 72)
+    print(f"Listings        : {len(listings)}")
+    print(f"Proceedings     : {len(final_records)}")
+    print(f"Successful      : {len(ok_records)}")
+    print(f"With email      : {with_email}")
+    print(f"Without email   : {len(ok_records) - with_email}")
+    print(f"Output          : {output_path.resolve()}")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
