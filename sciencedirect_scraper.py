@@ -1,20 +1,31 @@
 import os
 import re
-import time
 import json
+import time
+from datetime import datetime
 from urllib.parse import urljoin
 
 import pandas as pd
 
-from bs4 import BeautifulSoup
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from selenium.common.exceptions import (
+    TimeoutException,
+    WebDriverException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+    NoSuchElementException,
+)
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 OUTPUT_FOLDER = "sciencedirect_output"
@@ -29,8 +40,26 @@ CHECKPOINT_FILE = os.path.join(
     "checkpoint.json"
 )
 
-WAIT_BETWEEN_ARTICLES = 4
+ERROR_FILE = os.path.join(
+    OUTPUT_FOLDER,
+    "errors.json"
+)
 
+
+REMOTE_DEBUGGING_ADDRESS = "127.0.0.1:9222"
+
+PAGE_WAIT_SECONDS = 4
+
+AUTHOR_PANEL_WAIT_SECONDS = 8
+
+ARTICLE_DELAY_SECONDS = 3
+
+ISSUE_DELAY_SECONDS = 2
+
+
+# ============================================================
+# JOURNALS
+# ============================================================
 
 JOURNALS = [
     {
@@ -67,27 +96,26 @@ JOURNALS = [
 
 
 # ============================================================
-# CONNECT TO EXISTING CHROME
+# REGEX
 # ============================================================
 
-def connect_chrome():
+EMAIL_RE = re.compile(
+    r"\b"
+    r"[A-Za-z0-9._%+\-]+"
+    r"@"
+    r"[A-Za-z0-9.\-]+"
+    r"\."
+    r"[A-Za-z]{2,}"
+    r"\b"
+)
 
-    options = Options()
-
-    options.add_experimental_option(
-        "debuggerAddress",
-        "127.0.0.1:9222"
-    )
-
-    driver = webdriver.Chrome(
-        options=options
-    )
-
-    return driver
+YEAR_RE = re.compile(
+    r"\b(20\d{2})\b"
+)
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def clean_text(value):
@@ -95,35 +123,132 @@ def clean_text(value):
     if value is None:
         return ""
 
-    return re.sub(
+    value = str(value)
+
+    value = re.sub(
         r"\s+",
         " ",
-        str(value)
-    ).strip()
+        value
+    )
+
+    return value.strip()
+
+
+def normalize_url(url):
+
+    if not url:
+        return ""
+
+    url = url.split("#")[0]
+    url = url.split("?")[0]
+
+    return url.strip()
 
 
 def extract_year(text):
 
-    match = re.search(
-        r"\b(20\d{2})\b",
-        text or ""
+    if not text:
+        return None
+
+    match = YEAR_RE.search(
+        str(text)
     )
 
     if match:
-        return int(
-            match.group(1)
-        )
+
+        try:
+            return int(
+                match.group(1)
+            )
+
+        except Exception:
+            pass
 
     return None
 
 
+def save_json(path, data):
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            data,
+            file,
+            indent=2,
+            ensure_ascii=False
+        )
+
+
+def load_json(path):
+
+    if not os.path.exists(path):
+        return {}
+
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            return json.load(
+                file
+            )
+
+    except Exception:
+        return {}
+
+
 # ============================================================
-# BLOCK DETECTION
+# CONNECT TO OPEN CHROME
+# ============================================================
+
+def connect_to_chrome():
+
+    options = Options()
+
+    options.add_experimental_option(
+        "debuggerAddress",
+        REMOTE_DEBUGGING_ADDRESS
+    )
+
+    print(
+        f"Connecting to Chrome at "
+        f"{REMOTE_DEBUGGING_ADDRESS}..."
+    )
+
+    driver = webdriver.Chrome(
+        options=options
+    )
+
+    print(
+        "Connected to existing Chrome session."
+    )
+
+    return driver
+
+
+# ============================================================
+# BLOCK / ERROR PAGE DETECTION
 # ============================================================
 
 def is_blocked(driver):
 
-    source = driver.page_source.lower()
+    try:
+
+        source = (
+            driver.page_source
+            or ""
+        ).lower()
+
+    except Exception:
+
+        return False
 
     indicators = [
         "there was a problem providing the content you requested",
@@ -134,54 +259,61 @@ def is_blocked(driver):
     ]
 
     return any(
-        text in source
-        for text in indicators
+        indicator in source
+        for indicator in indicators
     )
 
 
 def wait_for_manual_access(driver):
 
-    while is_blocked(driver):
+    print()
+    print("=" * 100)
+    print("SCIENCEDIRECT BLOCK PAGE DETECTED")
+    print("=" * 100)
+    print()
+    print(
+        "Please resolve the page manually in the open Chrome window."
+    )
+    print(
+        "When the normal ScienceDirect page becomes visible, "
+        "the script will continue automatically."
+    )
+    print()
 
-        print()
-        print("=" * 90)
-
-        print(
-            "SCIENCEDIRECT BLOCK PAGE DETECTED"
-        )
-
-        print(
-            "Resolve/reload the page manually in Chrome."
-        )
-
-        print(
-            "The scraper will automatically continue "
-            "when the article becomes visible."
-        )
-
-        print("=" * 90)
-
-        time.sleep(10)
+    while True:
 
         try:
-            driver.refresh()
+
+            if not is_blocked(
+                driver
+            ):
+
+                print(
+                    "Normal ScienceDirect page detected. Continuing..."
+                )
+
+                return True
 
         except Exception:
             pass
 
-        time.sleep(5)
+        time.sleep(
+            5
+        )
 
 
 # ============================================================
-# PAGE LOAD
+# PAGE OPEN
 # ============================================================
 
-def open_page(driver, url):
+def open_page(
+    driver,
+    url,
+    wait_seconds=PAGE_WAIT_SECONDS
+):
 
-    print()
     print(
-        "Opening:",
-        url
+        f"Opening: {url}"
     )
 
     try:
@@ -193,34 +325,40 @@ def open_page(driver, url):
     except WebDriverException as exc:
 
         print(
-            "Browser error:",
-            exc
+            f"Browser error: {exc}"
         )
 
         return False
 
-    time.sleep(4)
+    time.sleep(
+        wait_seconds
+    )
 
-    if is_blocked(driver):
+    if is_blocked(
+        driver
+    ):
 
         wait_for_manual_access(
             driver
         )
 
-    return not is_blocked(
-        driver
-    )
+    return True
 
 
 # ============================================================
 # SCROLL
 # ============================================================
 
-def scroll_page(driver):
+def scroll_page(
+    driver,
+    max_scrolls=15
+):
 
     previous_height = 0
 
-    for _ in range(20):
+    for _ in range(
+        max_scrolls
+    ):
 
         try:
 
@@ -230,7 +368,10 @@ def scroll_page(driver):
                 )
             )
 
-            if current_height == previous_height:
+            if (
+                current_height
+                == previous_height
+            ):
                 break
 
             driver.execute_script(
@@ -242,7 +383,9 @@ def scroll_page(driver):
                 """
             )
 
-            time.sleep(1)
+            time.sleep(
+                0.8
+            )
 
             previous_height = (
                 current_height
@@ -253,366 +396,1285 @@ def scroll_page(driver):
 
 
 # ============================================================
-# ARTICLE URL EXTRACTION
+# ISSUE PAGE
 # ============================================================
 
-def extract_article_urls(driver):
+def extract_issue_links(
+    driver,
+    journal
+):
 
-    soup = BeautifulSoup(
-        driver.page_source,
-        "lxml"
+    issue_links = []
+
+    print()
+    print(
+        f"Opening journal issues page:"
     )
 
-    links = {}
+    print(
+        journal["url"]
+    )
 
-    for anchor in soup.find_all(
-        "a",
-        href=True
+    if not open_page(
+        driver,
+        journal["url"]
     ):
 
-        href = anchor.get(
-            "href",
-            ""
-        )
+        return []
 
-        if "/science/article/pii/" not in href:
+    scroll_page(
+        driver
+    )
+
+    anchors = driver.find_elements(
+        By.CSS_SELECTOR,
+        'a[href*="/vol/"][href*="/issue/"]'
+    )
+
+    print(
+        f"Potential issue links found: "
+        f"{len(anchors)}"
+    )
+
+    seen = set()
+
+    for anchor in anchors:
+
+        try:
+
+            href = anchor.get_attribute(
+                "href"
+            )
+
+            text = clean_text(
+                anchor.text
+            )
+
+            if not href:
+                continue
+
+            href = normalize_url(
+                href
+            )
+
+            if href in seen:
+                continue
+
+            possible_year = extract_year(
+                text
+            )
+
+            # If the year is visible in link text,
+            # filter immediately.
+            if possible_year:
+
+                if not (
+                    journal["start_year"]
+                    <= possible_year
+                    <= journal["end_year"]
+                ):
+
+                    continue
+
+            seen.add(
+                href
+            )
+
+            issue_links.append(
+                href
+            )
+
+        except Exception:
             continue
 
-        url = urljoin(
-            "https://www.sciencedirect.com",
-            href
+    return issue_links
+
+
+# ============================================================
+# ISSUE METADATA
+# ============================================================
+
+def extract_issue_metadata(
+    driver
+):
+
+    result = {
+        "journal": "",
+        "year": "",
+        "date": "",
+        "volume": "",
+        "issue": "",
+    }
+
+    # --------------------------------------------------------
+    # JOURNAL
+    # --------------------------------------------------------
+
+    selectors = [
+        ".publication-title",
+        "h1.journal-title",
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            elements = driver.find_elements(
+                By.CSS_SELECTOR,
+                selector
+            )
+
+            if elements:
+
+                text = clean_text(
+                    elements[0].text
+                )
+
+                if text:
+
+                    result[
+                        "journal"
+                    ] = text
+
+                    break
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # PAGE TEXT
+    # --------------------------------------------------------
+
+    try:
+
+        body_text = driver.find_element(
+            By.TAG_NAME,
+            "body"
+        ).text
+
+    except Exception:
+
+        body_text = ""
+
+    # Date: October 2026
+
+    match = re.search(
+        r"Date:\s*([A-Za-z]+\s+20\d{2})",
+        body_text,
+        re.I
+    )
+
+    if match:
+
+        result[
+            "date"
+        ] = clean_text(
+            match.group(1)
         )
 
-        url = url.split(
-            "?"
-        )[0]
+    # Year
 
-        url = url.split(
-            "#"
-        )[0]
+    year = extract_year(
+        result["date"]
+    )
 
-        links[url] = url
+    if not year:
 
-    return list(
-        links.values()
+        year = extract_year(
+            body_text
+        )
+
+    if year:
+
+        result[
+            "year"
+        ] = year
+
+    # Volume
+
+    match = re.search(
+        r"\bVolume\s+(\d+)",
+        body_text,
+        re.I
+    )
+
+    if match:
+
+        result[
+            "volume"
+        ] = match.group(1)
+
+    # Issue
+
+    match = re.search(
+        r"\bIssue\s+(\d+)",
+        body_text,
+        re.I
+    )
+
+    if match:
+
+        result[
+            "issue"
+        ] = match.group(1)
+
+    return result
+
+
+# ============================================================
+# ARTICLE LINKS FROM ISSUE
+# ============================================================
+
+def extract_article_urls(
+    driver
+):
+
+    urls = []
+
+    seen = set()
+
+    elements = driver.find_elements(
+        By.CSS_SELECTOR,
+        (
+            'a.article-content-title'
+            '[href*="/science/article/pii/"]'
+        )
+    )
+
+    for element in elements:
+
+        try:
+
+            href = element.get_attribute(
+                "href"
+            )
+
+            if not href:
+                continue
+
+            href = normalize_url(
+                href
+            )
+
+            if href in seen:
+                continue
+
+            seen.add(
+                href
+            )
+
+            urls.append(
+                href
+            )
+
+        except Exception:
+            continue
+
+    return urls
+
+
+# ============================================================
+# ARTICLE TITLE
+# ============================================================
+
+def extract_article_title(
+    driver
+):
+
+    selectors = [
+        "h1.content-title .title-text",
+        "#screen-reader-main-title .title-text",
+        "h1.content-title",
+        "h1",
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            elements = driver.find_elements(
+                By.CSS_SELECTOR,
+                selector
+            )
+
+            for element in elements:
+
+                text = clean_text(
+                    element.text
+                )
+
+                if text:
+                    return text
+
+        except Exception:
+            continue
+
+    return ""
+
+
+# ============================================================
+# DOI
+# ============================================================
+
+def extract_doi(
+    driver
+):
+
+    try:
+
+        links = driver.find_elements(
+            By.CSS_SELECTOR,
+            'a[href*="doi.org/10."]'
+        )
+
+        for link in links:
+
+            href = link.get_attribute(
+                "href"
+            )
+
+            if not href:
+                continue
+
+            match = re.search(
+                r"10\.\d{4,9}/[^\s?#]+",
+                href,
+                re.I
+            )
+
+            if match:
+
+                return (
+                    match
+                    .group(0)
+                    .rstrip(
+                        ".,;)"
+                    )
+                )
+
+    except Exception:
+        pass
+
+    return ""
+
+
+# ============================================================
+# ARTICLE METADATA
+# ============================================================
+
+def extract_article_metadata(
+    driver
+):
+
+    result = {
+        "journal": "",
+        "year": "",
+        "date": "",
+        "volume": "",
+        "issue": "",
+        "doi": "",
+    }
+
+    # --------------------------------------------------------
+    # JOURNAL
+    # --------------------------------------------------------
+
+    try:
+
+        journal_elements = (
+            driver.find_elements(
+                By.CSS_SELECTOR,
+                ".publication-title"
+            )
+        )
+
+        if journal_elements:
+
+            result[
+                "journal"
+            ] = clean_text(
+                journal_elements[
+                    0
+                ].text
+            )
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # METADATA SECTION
+    # --------------------------------------------------------
+
+    metadata_text = ""
+
+    try:
+
+        metadata_element = (
+            driver.find_element(
+                By.CSS_SELECTOR,
+                ".publication-metadata"
+            )
+        )
+
+        metadata_text = (
+            metadata_element.text
+        )
+
+    except Exception:
+
+        try:
+
+            metadata_text = (
+                driver.find_element(
+                    By.TAG_NAME,
+                    "body"
+                ).text
+            )
+
+        except Exception:
+            pass
+
+    # Date
+
+    date_match = re.search(
+        r"Date:\s*([A-Za-z]+\s+20\d{2})",
+        metadata_text,
+        re.I
+    )
+
+    if date_match:
+
+        result[
+            "date"
+        ] = clean_text(
+            date_match.group(1)
+        )
+
+    # Year
+
+    year = extract_year(
+        result[
+            "date"
+        ]
+    )
+
+    if year:
+
+        result[
+            "year"
+        ] = year
+
+    # Volume
+
+    volume_match = re.search(
+        r"\bVolume\s+(\d+)",
+        metadata_text,
+        re.I
+    )
+
+    if volume_match:
+
+        result[
+            "volume"
+        ] = volume_match.group(
+            1
+        )
+
+    # Issue
+
+    issue_match = re.search(
+        r"\bIssue\s+(\d+)",
+        metadata_text,
+        re.I
+    )
+
+    if issue_match:
+
+        result[
+            "issue"
+        ] = issue_match.group(
+            1
+        )
+
+    # DOI
+
+    result[
+        "doi"
+    ] = extract_doi(
+        driver
+    )
+
+    return result
+
+
+# ============================================================
+# CLEAN AUTHOR
+# ============================================================
+
+def clean_author_name(
+    name
+):
+
+    if not name:
+        return ""
+
+    name = clean_text(
+        name
+    )
+
+    degrees = [
+        "MD",
+        "DM",
+        "PhD",
+        "Ph.D",
+        "RN",
+        "MSc",
+        "MS",
+        "MBBS",
+        "MPH",
+        "DNP",
+        "FRCA",
+        "FRCPC",
+        "BSN",
+        "MSN",
+        "MBA",
+    ]
+
+    changed = True
+
+    while changed:
+
+        changed = False
+
+        for degree in degrees:
+
+            pattern = (
+                r"[\s,]+"
+                + re.escape(
+                    degree
+                )
+                + r"\.?$"
+            )
+
+            new_name = re.sub(
+                pattern,
+                "",
+                name,
+                flags=re.I
+            )
+
+            new_name = (
+                new_name
+                .strip(
+                    " ,"
+                )
+            )
+
+            if (
+                new_name
+                != name
+            ):
+
+                name = new_name
+
+                changed = True
+
+    return clean_text(
+        name
     )
 
 
 # ============================================================
-# EMAIL EXTRACTION
+# AUTHOR BUTTONS
 # ============================================================
 
-EMAIL_REGEX = re.compile(
-    r"""
-    \b
-    [A-Za-z0-9._%+\-]+
-    @
-    [A-Za-z0-9.\-]+
-    \.
-    [A-Za-z]{2,}
-    \b
-    """,
-    re.VERBOSE
-)
+def get_author_buttons(
+    driver
+):
+
+    return driver.find_elements(
+        By.CSS_SELECTOR,
+        (
+            'button'
+            '[data-sd-ui-side-panel-opener="true"]'
+            '[data-xocs-content-type="author"]'
+        )
+    )
 
 
-def extract_emails(soup):
+def author_name_from_button(
+    button
+):
 
-    emails = []
+    given_name = ""
+    surname = ""
 
-    # --------------------------------------------------------
-    # mailto:
-    # --------------------------------------------------------
+    try:
 
-    for anchor in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = anchor.get(
-            "href",
-            ""
+        given_elements = (
+            button.find_elements(
+                By.CSS_SELECTOR,
+                ".given-name"
+            )
         )
 
-        if href.lower().startswith(
-            "mailto:"
-        ):
+        if given_elements:
+
+            given_name = clean_text(
+                given_elements[
+                    0
+                ].text
+            )
+
+    except Exception:
+        pass
+
+    try:
+
+        surname_elements = (
+            button.find_elements(
+                By.CSS_SELECTOR,
+                ".surname"
+            )
+        )
+
+        if surname_elements:
+
+            surname = clean_text(
+                surname_elements[
+                    0
+                ].text
+            )
+
+    except Exception:
+        pass
+
+    if (
+        given_name
+        or surname
+    ):
+
+        return clean_author_name(
+            f"{given_name} {surname}"
+        )
+
+    try:
+
+        return clean_author_name(
+            button.text
+        )
+
+    except Exception:
+
+        return ""
+
+
+# ============================================================
+# AUTHOR PANEL DETECTION
+# ============================================================
+
+def find_author_panel(
+    driver
+):
+
+    selectors = [
+        '[role="dialog"]',
+        '[class*="side-panel"]',
+        '[class*="SidePanel"]',
+        '[class*="drawer"]',
+        '[data-testid*="side-panel"]',
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            panels = (
+                driver.find_elements(
+                    By.CSS_SELECTOR,
+                    selector
+                )
+            )
+
+            for panel in panels:
+
+                try:
+
+                    if not panel.is_displayed():
+                        continue
+
+                    text = clean_text(
+                        panel.text
+                    )
+
+                    if not text:
+                        continue
+
+                    if (
+                        "Author" in text
+                        or "Correspondence" in text
+                        or EMAIL_RE.search(
+                            text
+                        )
+                    ):
+
+                        return panel
+
+                except Exception:
+                    continue
+
+        except Exception:
+            continue
+
+    return None
+
+
+def wait_for_author_panel(
+    driver
+):
+
+    end_time = (
+        time.time()
+        + AUTHOR_PANEL_WAIT_SECONDS
+    )
+
+    while time.time() < end_time:
+
+        panel = find_author_panel(
+            driver
+        )
+
+        if panel is not None:
+
+            return panel
+
+        time.sleep(
+            0.3
+        )
+
+    return None
+
+
+# ============================================================
+# EXTRACT EMAIL FROM PANEL
+# ============================================================
+
+def extract_email_from_panel(
+    panel
+):
+
+    if panel is None:
+        return ""
+
+    # --------------------------------------------------------
+    # MAILTO
+    # --------------------------------------------------------
+
+    try:
+
+        links = panel.find_elements(
+            By.CSS_SELECTOR,
+            'a[href^="mailto:"]'
+        )
+
+        for link in links:
+
+            href = (
+                link.get_attribute(
+                    "href"
+                )
+                or ""
+            )
 
             email = (
                 href
-                .split(":", 1)[1]
-                .split("?", 1)[0]
+                .replace(
+                    "mailto:",
+                    ""
+                )
+                .split(
+                    "?"
+                )[0]
                 .strip()
                 .lower()
             )
 
-            if (
+            if EMAIL_RE.fullmatch(
                 email
-                and email not in emails
             ):
-                emails.append(
-                    email
-                )
+
+                return email
+
+    except Exception:
+        pass
 
     # --------------------------------------------------------
-    # visible page text
+    # PANEL TEXT
     # --------------------------------------------------------
 
-    text = soup.get_text(
-        " ",
-        strip=True
-    )
+    try:
 
-    found = EMAIL_REGEX.findall(
-        text
-    )
+        text = panel.text
 
-    for email in found:
-
-        email = email.lower()
-
-        if email not in emails:
-            emails.append(
-                email
-            )
-
-    # --------------------------------------------------------
-    # complete HTML
-    #
-    # Sometimes email information exists in attributes / JSON
-    # but isn't directly visible.
-    # --------------------------------------------------------
-
-    html_source = str(
-        soup
-    )
-
-    found = EMAIL_REGEX.findall(
-        html_source
-    )
-
-    for email in found:
-
-        email = (
-            email
-            .replace("\\u0040", "@")
-            .lower()
+        matches = EMAIL_RE.findall(
+            text
         )
 
-        if email not in emails:
-            emails.append(
-                email
+        if matches:
+
+            return (
+                matches[0]
+                .strip()
+                .lower()
             )
 
-    return emails
+    except Exception:
+        pass
 
+    # --------------------------------------------------------
+    # PANEL HTML
+    # --------------------------------------------------------
 
-# ============================================================
-# AUTHORS
-# ============================================================
+    try:
 
-def extract_authors(soup):
-
-    authors = []
-
-    # citation_author is generally the safest source
-
-    for meta in soup.find_all(
-        "meta",
-        attrs={
-            "name": "citation_author"
-        }
-    ):
-
-        author = clean_text(
-            meta.get(
-                "content",
-                ""
+        html = (
+            panel.get_attribute(
+                "outerHTML"
             )
+            or ""
         )
 
-        if (
-            author
-            and author not in authors
-        ):
-            authors.append(
-                author
+        matches = EMAIL_RE.findall(
+            html
+        )
+
+        if matches:
+
+            return (
+                matches[0]
+                .strip()
+                .lower()
             )
 
-    # DC.creator fallback
+    except Exception:
+        pass
 
-    if not authors:
-
-        for meta in soup.find_all(
-            "meta",
-            attrs={
-                "name": re.compile(
-                    r"dc\.creator",
-                    re.I
-                )
-            }
-        ):
-
-            author = clean_text(
-                meta.get(
-                    "content",
-                    ""
-                )
-            )
-
-            if (
-                author
-                and author not in authors
-            ):
-                authors.append(
-                    author
-                )
-
-    return authors
+    return ""
 
 
 # ============================================================
-# AUTHOR / EMAIL MATCHING
+# AFFILIATION
 # ============================================================
 
-def normalize_name(value):
-
-    value = (
-        value
-        .lower()
-        .strip()
-    )
-
-    value = re.sub(
-        r"[^a-z]",
-        "",
-        value
-    )
-
-    return value
-
-
-def email_username(email):
-
-    return (
-        email
-        .split("@", 1)[0]
-        .lower()
-    )
-
-
-def email_name_score(
-    author,
+def extract_affiliation_from_panel(
+    panel,
+    author_name,
     email
 ):
 
-    author_compact = normalize_name(
-        author
-    )
+    if panel is None:
+        return ""
 
-    username = email_username(
-        email
-    )
+    try:
 
-    username_compact = re.sub(
-        r"[^a-z]",
-        "",
-        username
-    )
+        text = (
+            panel.text
+            or ""
+        )
 
-    if not author_compact:
-        return 0
+    except Exception:
 
-    if not username_compact:
-        return 0
+        return ""
 
-    score = 0
+    lines = [
+        clean_text(
+            line
+        )
+        for line
+        in text.splitlines()
+        if clean_text(
+            line
+        )
+    ]
 
-    author_parts = re.findall(
-        r"[A-Za-z]+",
-        author.lower()
-    )
+    affiliation_lines = []
 
-    # Full name appears
-    if author_compact in username_compact:
-        score += 100
+    for line in lines:
 
-    # Username appears inside author
-    if username_compact in author_compact:
-        score += 80
+        lower = (
+            line
+            .lower()
+        )
 
-    # Individual name parts
-    for part in author_parts:
-
-        if len(part) < 2:
+        if lower == "author":
             continue
 
-        if part in username_compact:
-            score += 20
-
-    # First-letter initial matching
-    if author_parts:
-
-        first = author_parts[0]
-        last = author_parts[-1]
-
-        if username.startswith(
-            first[:1]
+        if (
+            author_name
+            and author_name.lower()
+            == lower
         ):
-            score += 5
+            continue
 
-        if last in username:
-            score += 30
+        if (
+            email
+            and email.lower()
+            == lower
+        ):
+            continue
 
-    return score
+        if "view in scopus" in lower:
+            continue
+
+        if "orcid" in lower:
+            continue
+
+        if lower.startswith(
+            "more documents"
+        ):
+            break
+
+        if (
+            "provided by scopus"
+            in lower
+        ):
+            break
+
+        affiliation_lines.append(
+            line
+        )
+
+    return clean_text(
+        " ".join(
+            affiliation_lines
+        )
+    )
 
 
-def match_author_emails(
-    authors,
-    emails
+# ============================================================
+# CLOSE PANEL
+# ============================================================
+
+def close_author_panel(
+    driver
+):
+
+    # --------------------------------------------------------
+    # aria-label close
+    # --------------------------------------------------------
+
+    selectors = [
+        'button[aria-label="Close"]',
+        'button[aria-label="close"]',
+        'button[title="Close"]',
+        'button[title="close"]',
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            buttons = (
+                driver.find_elements(
+                    By.CSS_SELECTOR,
+                    selector
+                )
+            )
+
+            for button in buttons:
+
+                if button.is_displayed():
+
+                    driver.execute_script(
+                        "arguments[0].click();",
+                        button
+                    )
+
+                    time.sleep(
+                        0.4
+                    )
+
+                    return True
+
+        except Exception:
+            continue
+
+    # --------------------------------------------------------
+    # Search visible buttons for X
+    # --------------------------------------------------------
+
+    try:
+
+        buttons = driver.find_elements(
+            By.TAG_NAME,
+            "button"
+        )
+
+        for button in reversed(
+            buttons
+        ):
+
+            try:
+
+                if not button.is_displayed():
+                    continue
+
+                aria = clean_text(
+                    button.get_attribute(
+                        "aria-label"
+                    )
+                ).lower()
+
+                title = clean_text(
+                    button.get_attribute(
+                        "title"
+                    )
+                ).lower()
+
+                text = clean_text(
+                    button.text
+                )
+
+                if (
+                    "close" in aria
+                    or "close" in title
+                    or text in [
+                        "×",
+                        "x"
+                    ]
+                ):
+
+                    driver.execute_script(
+                        "arguments[0].click();",
+                        button
+                    )
+
+                    time.sleep(
+                        0.4
+                    )
+
+                    return True
+
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # ESCAPE
+    # --------------------------------------------------------
+
+    try:
+
+        driver.find_element(
+            By.TAG_NAME,
+            "body"
+        ).send_keys(
+            Keys.ESCAPE
+        )
+
+        time.sleep(
+            0.4
+        )
+
+        return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+# ============================================================
+# EXTRACT ALL AUTHORS + EMAIL
+# ============================================================
+
+def extract_article_authors(
+    driver
 ):
 
     results = []
 
-    used_emails = set()
+    initial_buttons = (
+        get_author_buttons(
+            driver
+        )
+    )
 
-    for author in authors:
+    total_authors = len(
+        initial_buttons
+    )
 
-        best_email = ""
-        best_score = 0
+    print(
+        f"    Author buttons found: "
+        f"{total_authors}"
+    )
 
-        for email in emails:
+    for index in range(
+        total_authors
+    ):
 
-            if email in used_emails:
-                continue
+        # React can rebuild elements after each click.
+        # Always reacquire author buttons.
 
-            score = email_name_score(
-                author,
-                email
+        buttons = (
+            get_author_buttons(
+                driver
+            )
+        )
+
+        if index >= len(
+            buttons
+        ):
+            break
+
+        button = buttons[
+            index
+        ]
+
+        author_name = (
+            author_name_from_button(
+                button
+            )
+        )
+
+        author_id = (
+            button.get_attribute(
+                "data-xocs-content-id"
+            )
+            or ""
+        )
+
+        print(
+            f"      "
+            f"[{index + 1}/{total_authors}] "
+            f"{author_name} "
+            f"({author_id})"
+        )
+
+        email = ""
+        affiliation = ""
+
+        try:
+
+            driver.execute_script(
+                """
+                arguments[0].scrollIntoView({
+                    block: 'center',
+                    behavior: 'instant'
+                });
+                """,
+                button
             )
 
-            if score > best_score:
-
-                best_score = score
-                best_email = email
-
-        # Don't force weak guesses
-        if best_score >= 20:
-
-            used_emails.add(
-                best_email
+            time.sleep(
+                0.3
             )
 
-        else:
+            # -----------------------------------------------
+            # CLICK
+            # -----------------------------------------------
 
-            best_email = ""
+            try:
+
+                button.click()
+
+            except (
+                ElementClickInterceptedException,
+                StaleElementReferenceException
+            ):
+
+                buttons = (
+                    get_author_buttons(
+                        driver
+                    )
+                )
+
+                if index < len(
+                    buttons
+                ):
+
+                    button = (
+                        buttons[
+                            index
+                        ]
+                    )
+
+                    driver.execute_script(
+                        "arguments[0].click();",
+                        button
+                    )
+
+            # -----------------------------------------------
+            # WAIT PANEL
+            # -----------------------------------------------
+
+            panel = (
+                wait_for_author_panel(
+                    driver
+                )
+            )
+
+            if panel:
+
+                email = (
+                    extract_email_from_panel(
+                        panel
+                    )
+                )
+
+                affiliation = (
+                    extract_affiliation_from_panel(
+                        panel,
+                        author_name,
+                        email
+                    )
+                )
+
+            if email:
+
+                print(
+                    f"          EMAIL: "
+                    f"{email}"
+                )
+
+            else:
+
+                print(
+                    "          EMAIL: -"
+                )
+
+        except Exception as exc:
+
+            print(
+                f"          Author panel error: "
+                f"{exc}"
+            )
+
+        finally:
+
+            close_author_panel(
+                driver
+            )
+
+            time.sleep(
+                0.5
+            )
 
         results.append(
             {
-                "author": author,
-                "email": best_email,
-                "email_match_score":
-                    best_score,
+                "author":
+                    author_name,
+
+                "email":
+                    email,
+
+                "affiliation":
+                    affiliation,
+
+                "author_id":
+                    author_id,
             }
         )
 
@@ -620,231 +1682,356 @@ def match_author_emails(
 
 
 # ============================================================
-# ARTICLE METADATA
+# PARSE ARTICLE
 # ============================================================
-
-def meta_value(
-    soup,
-    name
-):
-
-    meta = soup.find(
-        "meta",
-        attrs={
-            "name": name
-        }
-    )
-
-    if meta:
-
-        return clean_text(
-            meta.get(
-                "content",
-                ""
-            )
-        )
-
-    return ""
-
 
 def parse_article(
     driver,
-    article_url
+    article_url,
+    expected_journal=None
 ):
+
+    print()
+    print(
+        "-" * 100
+    )
+
+    print(
+        f"ARTICLE: {article_url}"
+    )
 
     if not open_page(
         driver,
         article_url
     ):
+
         return []
 
-    # Some author details load after initial article content
-    time.sleep(2)
+    # Wait for author area.
 
-    scroll_page(
-        driver
-    )
+    try:
 
-    soup = BeautifulSoup(
-        driver.page_source,
-        "lxml"
-    )
-
-    title = meta_value(
-        soup,
-        "citation_title"
-    )
-
-    journal = meta_value(
-        soup,
-        "citation_journal_title"
-    )
-
-    doi = meta_value(
-        soup,
-        "citation_doi"
-    )
-
-    volume = meta_value(
-        soup,
-        "citation_volume"
-    )
-
-    issue = meta_value(
-        soup,
-        "citation_issue"
-    )
-
-    date_value = (
-        meta_value(
-            soup,
-            "citation_publication_date"
+        WebDriverWait(
+            driver,
+            10
+        ).until(
+            EC.presence_of_element_located(
+                (
+                    By.CSS_SELECTOR,
+                    "#author-group"
+                )
+            )
         )
-        or
-        meta_value(
-            soup,
-            "citation_date"
+
+    except TimeoutException:
+
+        pass
+
+    title = (
+        extract_article_title(
+            driver
         )
     )
 
-    year = extract_year(
-        date_value
+    metadata = (
+        extract_article_metadata(
+            driver
+        )
     )
 
-    authors = extract_authors(
-        soup
-    )
+    if (
+        not metadata[
+            "journal"
+        ]
+        and expected_journal
+    ):
 
-    emails = extract_emails(
-        soup
+        metadata[
+            "journal"
+        ] = expected_journal
+
+    print(
+        f"    Title  : {title}"
     )
 
     print(
-        f"    Authors : {len(authors)}"
+        f"    Journal: "
+        f"{metadata['journal']}"
     )
 
     print(
-        f"    Emails  : {len(emails)}"
+        f"    Date   : "
+        f"{metadata['date']}"
     )
 
-    matches = match_author_emails(
-        authors,
-        emails
+    print(
+        f"    Volume : "
+        f"{metadata['volume']}"
+    )
+
+    print(
+        f"    Issue  : "
+        f"{metadata['issue']}"
+    )
+
+    print(
+        f"    DOI    : "
+        f"{metadata['doi']}"
+    )
+
+    authors = (
+        extract_article_authors(
+            driver
+        )
     )
 
     rows = []
 
-    for match in matches:
+    for author in authors:
 
         rows.append(
             {
                 "journal":
-                    journal,
+                    metadata[
+                        "journal"
+                    ],
 
                 "year":
-                    year or "",
+                    metadata[
+                        "year"
+                    ],
+
+                "date":
+                    metadata[
+                        "date"
+                    ],
 
                 "volume":
-                    volume,
+                    metadata[
+                        "volume"
+                    ],
 
                 "issue":
-                    issue,
+                    metadata[
+                        "issue"
+                    ],
 
                 "article_title":
                     title,
 
                 "author":
-                    match["author"],
-
-                "email":
-                    match["email"],
-
-                "email_match_score":
-                    match[
-                        "email_match_score"
+                    author[
+                        "author"
                     ],
 
-                "all_found_emails":
-                    "; ".join(
-                        emails
-                    ),
+                "email":
+                    author[
+                        "email"
+                    ],
+
+                "affiliation":
+                    author[
+                        "affiliation"
+                    ],
+
+                "author_id":
+                    author[
+                        "author_id"
+                    ],
 
                 "doi":
-                    doi,
+                    metadata[
+                        "doi"
+                    ],
 
                 "article_url":
                     article_url,
             }
         )
 
-    # If no author metadata exists but email exists
-    if not authors:
-
-        for email in emails:
-
-            rows.append(
-                {
-                    "journal":
-                        journal,
-
-                    "year":
-                        year or "",
-
-                    "volume":
-                        volume,
-
-                    "issue":
-                        issue,
-
-                    "article_title":
-                        title,
-
-                    "author":
-                        "",
-
-                    "email":
-                        email,
-
-                    "email_match_score":
-                        0,
-
-                    "all_found_emails":
-                        "; ".join(
-                            emails
-                        ),
-
-                    "doi":
-                        doi,
-
-                    "article_url":
-                        article_url,
-                }
-            )
-
     return rows
 
 
 # ============================================================
-# SAVE EXCEL
+# CHECKPOINT
 # ============================================================
 
-def save_excel(records):
+def load_checkpoint():
+
+    data = load_json(
+        CHECKPOINT_FILE
+    )
+
+    records = data.get(
+        "records",
+        []
+    )
+
+    completed_articles = set(
+        data.get(
+            "completed_articles",
+            []
+        )
+    )
+
+    return (
+        records,
+        completed_articles
+    )
+
+
+def save_checkpoint(
+    records,
+    completed_articles
+):
+
+    save_json(
+        CHECKPOINT_FILE,
+        {
+            "updated_at":
+                datetime.now()
+                .isoformat(),
+
+            "records":
+                records,
+
+            "completed_articles":
+                sorted(
+                    completed_articles
+                ),
+        }
+    )
+
+
+# ============================================================
+# EXCEL
+# ============================================================
+
+def save_excel(
+    records
+):
 
     if not records:
+
+        print(
+            "No records to save."
+        )
+
         return
 
     df = pd.DataFrame(
         records
     )
 
-    df = df.drop_duplicates(
+    required_columns = [
+        "journal",
+        "year",
+        "date",
+        "volume",
+        "issue",
+        "article_title",
+        "author",
+        "email",
+        "affiliation",
+        "author_id",
+        "doi",
+        "article_url",
+    ]
+
+    for column in required_columns:
+
+        if column not in df.columns:
+
+            df[
+                column
+            ] = ""
+
+    df = df[
+        required_columns
+    ]
+
+    # Remove duplicate author/article records
+
+    df.drop_duplicates(
         subset=[
             "article_url",
+            "author"
+        ],
+        keep="first",
+        inplace=True
+    )
+
+    # Prioritize rows with emails when sorting
+
+    df[
+        "_has_email"
+    ] = (
+        df[
+            "email"
+        ]
+        .astype(str)
+        .str.strip()
+        .ne("")
+    )
+
+    df.sort_values(
+        by=[
+            "journal",
+            "year",
+            "volume",
+            "issue",
+            "article_title",
+            "_has_email",
             "author",
+        ],
+        ascending=[
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+            True,
+        ],
+        inplace=True
+    )
+
+    df.drop(
+        columns=[
+            "_has_email"
+        ],
+        inplace=True
+    )
+
+    # --------------------------------------------------------
+    # EMAIL ONLY SHEET
+    # --------------------------------------------------------
+
+    email_df = (
+        df[
+            df[
+                "email"
+            ]
+            .astype(str)
+            .str.strip()
+            .ne("")
+        ]
+        .copy()
+    )
+
+    # Remove duplicate email addresses
+
+    email_df.drop_duplicates(
+        subset=[
             "email"
         ],
-        keep="first"
+        keep="first",
+        inplace=True
     )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
 
     with pd.ExcelWriter(
         OUTPUT_FILE,
@@ -853,107 +2040,77 @@ def save_excel(records):
 
         df.to_excel(
             writer,
-            sheet_name="Authors",
+            sheet_name="All Authors",
             index=False
         )
 
-        ws = writer.book[
-            "Authors"
-        ]
-
-        ws.freeze_panes = "A2"
-
-        ws.auto_filter.ref = (
-            ws.dimensions
+        email_df.to_excel(
+            writer,
+            sheet_name="Authors With Email",
+            index=False
         )
 
-        widths = {
-            "A": 45,
-            "B": 12,
-            "C": 12,
-            "D": 12,
-            "E": 70,
-            "F": 35,
-            "G": 45,
-            "H": 20,
-            "I": 80,
-            "J": 35,
-            "K": 80,
-        }
-
-        for column, width in widths.items():
-
-            ws.column_dimensions[
-                column
-            ].width = width
-
-
-# ============================================================
-# CHECKPOINT
-# ============================================================
-
-def save_checkpoint(
-    records,
-    completed
-):
-
-    with open(
-        CHECKPOINT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            {
-                "records":
-                    records,
-
-                "completed":
-                    list(
-                        completed
-                    )
-            },
-            f,
-            ensure_ascii=False,
-            indent=2
+        workbook = (
+            writer.book
         )
 
+        for sheet_name in [
+            "All Authors",
+            "Authors With Email",
+        ]:
 
-def load_checkpoint():
-
-    if not os.path.exists(
-        CHECKPOINT_FILE
-    ):
-        return [], set()
-
-    try:
-
-        with open(
-            CHECKPOINT_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(
-                f
+            worksheet = (
+                workbook[
+                    sheet_name
+                ]
             )
 
-        return (
-            data.get(
-                "records",
-                []
-            ),
-            set(
-                data.get(
-                    "completed",
-                    []
-                )
+            worksheet.freeze_panes = (
+                "A2"
             )
-        )
 
-    except Exception:
+            worksheet.auto_filter.ref = (
+                worksheet.dimensions
+            )
 
-        return [], set()
+            widths = {
+                "A": 45,
+                "B": 10,
+                "C": 18,
+                "D": 10,
+                "E": 10,
+                "F": 70,
+                "G": 35,
+                "H": 45,
+                "I": 80,
+                "J": 15,
+                "K": 35,
+                "L": 85,
+            }
+
+            for column, width in (
+                widths.items()
+            ):
+
+                worksheet.column_dimensions[
+                    column
+                ].width = width
+
+    print()
+    print(
+        f"Excel saved: "
+        f"{os.path.abspath(OUTPUT_FILE)}"
+    )
+
+    print(
+        f"Total author rows: "
+        f"{len(df):,}"
+    )
+
+    print(
+        f"Rows with email: "
+        f"{len(email_df):,}"
+    )
 
 
 # ============================================================
@@ -967,240 +2124,426 @@ def main():
         exist_ok=True
     )
 
-    records, completed = (
+    records, completed_articles = (
         load_checkpoint()
     )
 
-    driver = connect_chrome()
+    errors = load_json(
+        ERROR_FILE
+    )
+
+    if not isinstance(
+        errors,
+        list
+    ):
+        errors = []
+
+    print("=" * 110)
+    print("SCIENCEDIRECT AUTHOR + EMAIL SCRAPER")
+    print("=" * 110)
 
     print()
-    print("=" * 100)
-    print("SCIENCEDIRECT EMAIL SCRAPER")
-    print("USING EXISTING CHROME SESSION")
-    print("=" * 100)
-
     print(
-        f"Existing records: "
+        f"Existing records : "
         f"{len(records):,}"
     )
 
-    for journal in JOURNALS:
+    print(
+        f"Completed articles: "
+        f"{len(completed_articles):,}"
+    )
 
-        print()
-        print("=" * 100)
+    print()
 
-        print(
-            journal["name"]
-        )
+    driver = connect_to_chrome()
 
-        print(
-            f"{journal['start_year']} - "
-            f"{journal['end_year']}"
-        )
+    try:
 
-        print("=" * 100)
-
-        if not open_page(
-            driver,
-            journal["url"]
-        ):
-            continue
-
-        scroll_page(
-            driver
-        )
-
-        issue_source = BeautifulSoup(
-            driver.page_source,
-            "lxml"
-        )
-
-        # Get possible issue links
-        issue_links = []
-
-        for a in issue_source.find_all(
-            "a",
-            href=True
+        for journal_index, journal in enumerate(
+            JOURNALS,
+            start=1
         ):
 
-            href = a[
-                "href"
-            ]
+            print()
+            print("=" * 110)
 
-            text = clean_text(
-                a.get_text(
-                    " ",
-                    strip=True
-                )
+            print(
+                f"[{journal_index}/"
+                f"{len(JOURNALS)}] "
+                f"{journal['name']}"
             )
 
-            year = extract_year(
-                text + " " + href
+            print(
+                f"Years: "
+                f"{journal['start_year']} - "
+                f"{journal['end_year']}"
             )
 
-            if year:
+            print("=" * 110)
 
-                if not (
-                    journal[
-                        "start_year"
-                    ]
-                    <= year
-                    <= journal[
-                        "end_year"
-                    ]
-                ):
-                    continue
+            # =================================================
+            # ISSUES
+            # =================================================
 
-            if (
-                "/issue/" in href
-                or "/vol/" in href
-            ):
-
-                url = urljoin(
-                    "https://www.sciencedirect.com",
-                    href
-                )
-
-                if url not in issue_links:
-
-                    issue_links.append(
-                        url
-                    )
-
-        print(
-            f"Issues found: "
-            f"{len(issue_links)}"
-        )
-
-        for issue_url in issue_links:
-
-            if not open_page(
-                driver,
-                issue_url
-            ):
-                continue
-
-            scroll_page(
-                driver
-            )
-
-            article_urls = (
-                extract_article_urls(
-                    driver
+            issue_links = (
+                extract_issue_links(
+                    driver,
+                    journal
                 )
             )
 
             print(
-                f"Articles: "
-                f"{len(article_urls)}"
+                f"Issue links collected: "
+                f"{len(issue_links)}"
             )
 
-            for index, article_url in enumerate(
-                article_urls,
-                1
+            for issue_index, issue_url in enumerate(
+                issue_links,
+                start=1
             ):
-
-                if article_url in completed:
-
-                    continue
 
                 print()
                 print(
-                    f"[{index}/"
-                    f"{len(article_urls)}]"
+                    f"[Issue "
+                    f"{issue_index}/"
+                    f"{len(issue_links)}]"
+                )
+
+                print(
+                    issue_url
                 )
 
                 try:
 
-                    article_records = (
-                        parse_article(
-                            driver,
-                            article_url
+                    if not open_page(
+                        driver,
+                        issue_url
+                    ):
+
+                        continue
+
+                    time.sleep(
+                        ISSUE_DELAY_SECONDS
+                    )
+
+                    issue_metadata = (
+                        extract_issue_metadata(
+                            driver
                         )
                     )
 
-                    # Year filtering
-                    valid_records = []
-
-                    for row in article_records:
-
-                        year = row.get(
+                    issue_year = (
+                        issue_metadata.get(
                             "year"
                         )
+                    )
 
-                        if year:
+                    print(
+                        f"Issue year: "
+                        f"{issue_year}"
+                    )
+
+                    # ------------------------------------------
+                    # YEAR FILTER
+                    # ------------------------------------------
+
+                    if issue_year:
+
+                        try:
+
+                            issue_year_int = int(
+                                issue_year
+                            )
+
+                        except Exception:
+
+                            issue_year_int = None
+
+                        if issue_year_int:
 
                             if not (
                                 journal[
                                     "start_year"
                                 ]
-                                <= int(year)
+                                <= issue_year_int
                                 <= journal[
                                     "end_year"
                                 ]
                             ):
+
+                                print(
+                                    "Skipping issue outside "
+                                    "requested year range."
+                                )
+
                                 continue
 
-                        valid_records.append(
-                            row
+                    # ------------------------------------------
+                    # ARTICLE LINKS
+                    # ------------------------------------------
+
+                    article_urls = (
+                        extract_article_urls(
+                            driver
                         )
-
-                    records.extend(
-                        valid_records
                     )
 
-                    completed.add(
-                        article_url
+                    print(
+                        f"Articles found: "
+                        f"{len(article_urls)}"
                     )
 
-                    save_checkpoint(
-                        records,
-                        completed
-                    )
-
-                    if (
-                        len(completed)
-                        % 10 == 0
+                    for article_index, article_url in enumerate(
+                        article_urls,
+                        start=1
                     ):
 
-                        save_excel(
-                            records
+                        article_url = (
+                            normalize_url(
+                                article_url
+                            )
                         )
 
-                    time.sleep(
-                        WAIT_BETWEEN_ARTICLES
-                    )
+                        if (
+                            article_url
+                            in completed_articles
+                        ):
+
+                            print(
+                                f"[{article_index}/"
+                                f"{len(article_urls)}] "
+                                f"Already processed"
+                            )
+
+                            continue
+
+                        print()
+                        print(
+                            f"[Article "
+                            f"{article_index}/"
+                            f"{len(article_urls)}]"
+                        )
+
+                        try:
+
+                            article_records = (
+                                parse_article(
+                                    driver,
+                                    article_url,
+                                    expected_journal=
+                                        journal[
+                                            "name"
+                                        ]
+                                )
+                            )
+
+                            # ----------------------------------
+                            # FINAL YEAR FILTER
+                            # ----------------------------------
+
+                            accepted_records = []
+
+                            for record in article_records:
+
+                                year = record.get(
+                                    "year"
+                                )
+
+                                if year:
+
+                                    try:
+
+                                        year_int = int(
+                                            year
+                                        )
+
+                                    except Exception:
+
+                                        year_int = None
+
+                                    if year_int:
+
+                                        if not (
+                                            journal[
+                                                "start_year"
+                                            ]
+                                            <= year_int
+                                            <= journal[
+                                                "end_year"
+                                            ]
+                                        ):
+
+                                            continue
+
+                                accepted_records.append(
+                                    record
+                                )
+
+                            records.extend(
+                                accepted_records
+                            )
+
+                            completed_articles.add(
+                                article_url
+                            )
+
+                            # ----------------------------------
+                            # SAVE CHECKPOINT AFTER EVERY ARTICLE
+                            # ----------------------------------
+
+                            save_checkpoint(
+                                records,
+                                completed_articles
+                            )
+
+                            # ----------------------------------
+                            # SAVE EXCEL EVERY 10 ARTICLES
+                            # ----------------------------------
+
+                            if (
+                                len(
+                                    completed_articles
+                                )
+                                % 10 == 0
+                            ):
+
+                                save_excel(
+                                    records
+                                )
+
+                            time.sleep(
+                                ARTICLE_DELAY_SECONDS
+                            )
+
+                        except Exception as exc:
+
+                            print(
+                                f"ARTICLE ERROR: "
+                                f"{exc}"
+                            )
+
+                            errors.append(
+                                {
+                                    "type":
+                                        "article",
+
+                                    "journal":
+                                        journal[
+                                            "name"
+                                        ],
+
+                                    "url":
+                                        article_url,
+
+                                    "error":
+                                        str(exc),
+
+                                    "timestamp":
+                                        datetime.now()
+                                        .isoformat(),
+                                }
+                            )
+
+                            save_json(
+                                ERROR_FILE,
+                                errors
+                            )
 
                 except Exception as exc:
 
                     print(
-                        "ERROR:",
-                        exc
+                        f"ISSUE ERROR: "
+                        f"{exc}"
                     )
 
-    save_excel(
-        records
-    )
+                    errors.append(
+                        {
+                            "type":
+                                "issue",
 
-    save_checkpoint(
-        records,
-        completed
-    )
+                            "journal":
+                                journal[
+                                    "name"
+                                ],
 
-    print()
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
+                            "url":
+                                issue_url,
 
-    print(
-        f"Records: "
-        f"{len(records):,}"
-    )
+                            "error":
+                                str(exc),
 
-    print(
-        f"Excel: "
-        f"{OUTPUT_FILE}"
-    )
+                            "timestamp":
+                                datetime.now()
+                                .isoformat(),
+                        }
+                    )
+
+                    save_json(
+                        ERROR_FILE,
+                        errors
+                    )
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Stopped manually."
+        )
+
+    finally:
+
+        # =====================================================
+        # FINAL SAVE
+        # =====================================================
+
+        save_checkpoint(
+            records,
+            completed_articles
+        )
+
+        save_json(
+            ERROR_FILE,
+            errors
+        )
+
+        save_excel(
+            records
+        )
+
+        print()
+        print("=" * 110)
+        print("FINISHED")
+        print("=" * 110)
+
+        print(
+            f"Completed articles : "
+            f"{len(completed_articles):,}"
+        )
+
+        print(
+            f"Author records     : "
+            f"{len(records):,}"
+        )
+
+        print(
+            f"Errors             : "
+            f"{len(errors):,}"
+        )
+
+        print(
+            f"Excel              : "
+            f"{os.path.abspath(OUTPUT_FILE)}"
+        )
+
+        print(
+            f"Checkpoint         : "
+            f"{os.path.abspath(CHECKPOINT_FILE)}"
+        )
+
+        print(
+            f"Errors JSON        : "
+            f"{os.path.abspath(ERROR_FILE)}"
+        )
 
 
 if __name__ == "__main__":
