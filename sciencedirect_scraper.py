@@ -3,6 +3,8 @@ import re
 import json
 import time
 import random
+import socket
+import subprocess
 from datetime import datetime
 
 import pandas as pd
@@ -20,8 +22,6 @@ from selenium.common.exceptions import (
     WebDriverException,
     NoSuchWindowException,
     InvalidSessionIdException,
-    StaleElementReferenceException,
-    ElementClickInterceptedException,
 )
 
 
@@ -48,14 +48,28 @@ ERROR_FILE = os.path.join(
 
 
 # ============================================================
-# CHROME
+# CHROME CONFIGURATION
 # ============================================================
 
-REMOTE_DEBUGGING_ADDRESS = "127.0.0.1:9222"
+CHROME_EXE = (
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+)
+
+CHROME_PROFILE_DIR = (
+    r"C:\chrome-sciencedirect"
+)
+
+REMOTE_DEBUGGING_PORT = 9222
+
+REMOTE_DEBUGGING_ADDRESS = (
+    f"127.0.0.1:{REMOTE_DEBUGGING_PORT}"
+)
+
+chrome_process = None
 
 
 # ============================================================
-# NORMAL REQUEST PACING
+# NORMAL PACING
 # ============================================================
 
 PAGE_LOAD_WAIT_MIN = 4
@@ -71,7 +85,9 @@ AUTHOR_CLICK_DELAY_MIN = 1.0
 AUTHOR_CLICK_DELAY_MAX = 2.5
 
 AUTHOR_PANEL_OPEN_TIMEOUT = 15
+
 AUTHOR_EMAIL_TIMEOUT = 25
+
 AUTHOR_EMAIL_POLL_INTERVAL = 0.5
 
 
@@ -80,32 +96,32 @@ AUTHOR_EMAIL_POLL_INTERVAL = 0.5
 # ============================================================
 
 COOLDOWN_AFTER_ARTICLES = 10
-COOLDOWN_SECONDS_MIN = 45
+
+COOLDOWN_SECONDS_MIN = 60
+
 COOLDOWN_SECONDS_MAX = 90
 
 
 # ============================================================
-# BLOCK RETRY
+# BLOCK RECOVERY
 # ============================================================
 
-# When CPE00001 / CPE00002 occurs:
+# ScienceDirect block:
 #
-# retry 1 -> wait 1 minute
-# retry 2 -> wait 3 minutes
-# retry 3 -> wait 5 minutes
-# retry 4 -> wait 10 minutes
-# retry 5 -> wait 15 minutes
+# attempt 1 = close Chrome, wait 2 min
+# attempt 2 = close Chrome, wait 5 min
+# attempt 3 = close Chrome, wait 10 min
+# attempt 4 = close Chrome, wait 20 min
 
-BLOCK_BACKOFF_STEPS = [
-    60,
-    180,
+BLOCK_RESTART_WAITS = [
+    120,
     300,
     600,
-    900,
+    1200,
 ]
 
-MAX_BLOCK_RETRIES = len(
-    BLOCK_BACKOFF_STEPS
+MAX_BLOCK_RESTARTS = len(
+    BLOCK_RESTART_WAITS
 )
 
 
@@ -123,31 +139,58 @@ SAVE_EVERY_N_ARTICLES = 5
 JOURNALS = [
     {
         "name": "Journal of PeriAnesthesia Nursing",
-        "url": "https://www.sciencedirect.com/journal/journal-of-perianesthesia-nursing/issues",
+        "url": (
+            "https://www.sciencedirect.com/journal/"
+            "journal-of-perianesthesia-nursing/issues"
+        ),
         "start_year": 2025,
         "end_year": 2026,
     },
     {
         "name": "Journal of Clinical Anesthesia",
-        "url": "https://www.sciencedirect.com/journal/journal-of-clinical-anesthesia/issues",
+        "url": (
+            "https://www.sciencedirect.com/journal/"
+            "journal-of-clinical-anesthesia/issues"
+        ),
         "start_year": 2025,
         "end_year": 2027,
     },
     {
-        "name": "Journal of Cardiothoracic and Vascular Anesthesia",
-        "url": "https://www.sciencedirect.com/journal/journal-of-cardiothoracic-and-vascular-anesthesia/issues",
+        "name": (
+            "Journal of Cardiothoracic "
+            "and Vascular Anesthesia"
+        ),
+        "url": (
+            "https://www.sciencedirect.com/journal/"
+            "journal-of-cardiothoracic-and-vascular-anesthesia/"
+            "issues"
+        ),
         "start_year": 2025,
         "end_year": 2026,
     },
     {
-        "name": "Journal of Anesthesia and Translational Medicine",
-        "url": "https://www.sciencedirect.com/journal/journal-of-anesthesia-and-translational-medicine/issues",
+        "name": (
+            "Journal of Anesthesia "
+            "and Translational Medicine"
+        ),
+        "url": (
+            "https://www.sciencedirect.com/journal/"
+            "journal-of-anesthesia-and-translational-medicine/"
+            "issues"
+        ),
         "start_year": 2025,
         "end_year": 2026,
     },
     {
-        "name": "International Journal of Obstetric Anesthesia",
-        "url": "https://www.sciencedirect.com/journal/international-journal-of-obstetric-anesthesia/issues",
+        "name": (
+            "International Journal "
+            "of Obstetric Anesthesia"
+        ),
+        "url": (
+            "https://www.sciencedirect.com/journal/"
+            "international-journal-of-obstetric-anesthesia/"
+            "issues"
+        ),
         "start_year": 2025,
         "end_year": 2026,
     },
@@ -174,7 +217,7 @@ YEAR_RE = re.compile(
 
 
 # ============================================================
-# EXCEPTIONS
+# CUSTOM EXCEPTIONS
 # ============================================================
 
 class BrowserSessionLost(Exception):
@@ -186,7 +229,7 @@ class ScienceDirectBlocked(Exception):
 
 
 # ============================================================
-# BASIC HELPERS
+# GENERIC HELPERS
 # ============================================================
 
 def clean_text(value):
@@ -225,13 +268,11 @@ def extract_year(text):
         return None
 
     try:
-
         return int(
             match.group(1)
         )
 
     except Exception:
-
         return None
 
 
@@ -282,7 +323,6 @@ def load_json(path):
     if not os.path.exists(
         path
     ):
-
         return {}
 
     try:
@@ -303,13 +343,129 @@ def load_json(path):
 
 
 # ============================================================
-# CHROME CONNECTION
+# CHROME PORT CHECK
+# ============================================================
+
+def chrome_debug_port_open():
+
+    try:
+
+        with socket.create_connection(
+            (
+                "127.0.0.1",
+                REMOTE_DEBUGGING_PORT
+            ),
+            timeout=2
+        ):
+
+            return True
+
+    except OSError:
+
+        return False
+
+
+# ============================================================
+# START DEDICATED CHROME
+# ============================================================
+
+def start_sciencedirect_chrome():
+
+    global chrome_process
+
+    if chrome_debug_port_open():
+
+        print(
+            "Chrome debugging port is already available."
+        )
+
+        return True
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "STARTING DEDICATED SCIENCEDIRECT CHROME"
+    )
+    print(
+        "=" * 100
+    )
+
+    if not os.path.exists(
+        CHROME_EXE
+    ):
+
+        raise RuntimeError(
+            f"Chrome not found: {CHROME_EXE}"
+        )
+
+    chrome_process = subprocess.Popen(
+        [
+            CHROME_EXE,
+
+            (
+                f"--remote-debugging-port="
+                f"{REMOTE_DEBUGGING_PORT}"
+            ),
+
+            (
+                f"--user-data-dir="
+                f"{CHROME_PROFILE_DIR}"
+            ),
+
+            "--no-first-run",
+
+            "--no-default-browser-check",
+
+            "https://www.sciencedirect.com/",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    print(
+        f"Chrome started. PID: "
+        f"{chrome_process.pid}"
+    )
+
+    for _ in range(
+        30
+    ):
+
+        if chrome_debug_port_open():
+
+            print(
+                "Chrome debugging port is ready."
+            )
+
+            time.sleep(
+                3
+            )
+
+            return True
+
+        time.sleep(
+            1
+        )
+
+    raise RuntimeError(
+        "Chrome debugging port did not become ready."
+    )
+
+
+# ============================================================
+# CONNECT SELENIUM TO CHROME
 # ============================================================
 
 def connect_to_chrome():
 
+    if not chrome_debug_port_open():
+
+        start_sciencedirect_chrome()
+
     print(
-        f"Connecting to Chrome at "
+        f"Connecting Selenium to "
         f"{REMOTE_DEBUGGING_ADDRESS}..."
     )
 
@@ -320,27 +476,52 @@ def connect_to_chrome():
         REMOTE_DEBUGGING_ADDRESS
     )
 
-    driver = webdriver.Chrome(
-        options=options
+    for attempt in range(
+        1,
+        6
+    ):
+
+        try:
+
+            driver = webdriver.Chrome(
+                options=options
+            )
+
+            handles = (
+                driver.window_handles
+            )
+
+            if not handles:
+
+                raise RuntimeError(
+                    "No Chrome browser window available."
+                )
+
+            driver.switch_to.window(
+                handles[-1]
+            )
+
+            print(
+                "Connected to Chrome."
+            )
+
+            return driver
+
+        except Exception as exc:
+
+            print(
+                f"Chrome connection "
+                f"{attempt}/5 failed: "
+                f"{exc}"
+            )
+
+            time.sleep(
+                2
+            )
+
+    raise BrowserSessionLost(
+        "Unable to connect Selenium to Chrome."
     )
-
-    handles = driver.window_handles
-
-    if not handles:
-
-        raise BrowserSessionLost(
-            "Chrome is running but no usable tab/window exists."
-        )
-
-    driver.switch_to.window(
-        handles[-1]
-    )
-
-    print(
-        "Connected to existing Chrome session."
-    )
-
-    return driver
 
 
 # ============================================================
@@ -393,80 +574,97 @@ def ensure_driver_alive(
     ):
 
         raise BrowserSessionLost(
-            "Chrome/Selenium window is no longer available."
+            "Chrome/Selenium window is unavailable."
         )
 
 
 # ============================================================
-# TRY RECONNECT
+# CLOSE DEDICATED CHROME
 # ============================================================
 
-def reconnect_to_chrome(
-    old_driver=None
+def close_sciencedirect_chrome(
+    driver=None
 ):
+
+    global chrome_process
 
     print()
     print(
-        "=" * 100
+        "Closing dedicated ScienceDirect Chrome..."
     )
 
-    print(
-        "ATTEMPTING TO RECONNECT TO CHROME"
-    )
+    # --------------------------------------------------------
+    # CLOSE SELENIUM SESSION
+    # --------------------------------------------------------
 
-    print(
-        "=" * 100
-    )
+    if driver is not None:
 
-    try:
+        try:
 
-        if old_driver:
+            driver.quit()
 
-            old_driver.quit()
+        except Exception:
 
-    except Exception:
+            pass
 
-        pass
+    # --------------------------------------------------------
+    # IF SCRIPT STARTED CHROME, KILL ONLY ITS TREE
+    # --------------------------------------------------------
 
-    for attempt in range(
-        1,
-        6
+    if (
+        chrome_process is not None
+        and
+        chrome_process.poll() is None
     ):
 
         try:
 
-            print(
-                f"Reconnect attempt "
-                f"{attempt}/5..."
+            subprocess.run(
+                [
+                    "taskkill",
+                    "/PID",
+                    str(
+                        chrome_process.pid
+                    ),
+                    "/T",
+                    "/F",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
             )
-
-            driver = (
-                connect_to_chrome()
-            )
-
-            if driver_is_alive(
-                driver
-            ):
-
-                print(
-                    "Chrome reconnection successful."
-                )
-
-                return driver
 
         except Exception as exc:
 
             print(
-                f"Reconnect failed: "
+                f"Chrome close warning: "
                 f"{exc}"
             )
 
+    chrome_process = None
+
+    # --------------------------------------------------------
+    # WAIT FOR DEBUG PORT TO DISAPPEAR
+    # --------------------------------------------------------
+
+    for _ in range(
+        20
+    ):
+
+        if not chrome_debug_port_open():
+
+            break
+
         time.sleep(
-            5
+            1
         )
 
-    raise BrowserSessionLost(
-        "Unable to reconnect to Chrome."
+    time.sleep(
+        3
+    )
+
+    print(
+        "Dedicated Chrome closed."
     )
 
 
@@ -495,77 +693,31 @@ def is_sciencedirect_blocked(
         return False
 
     indicators = [
-        "there was a problem providing the content you requested",
+        (
+            "there was a problem providing "
+            "the content you requested"
+        ),
         "cpe00001",
         "cpe00002",
         "reference number:",
-        "unusual traffic",
         "access denied",
+        "unusual traffic",
     ]
 
-    for indicator in indicators:
-
-        if (
-            indicator in html
-            or
-            indicator in title
-        ):
-
-            return True
-
-    return False
+    return any(
+        marker in html
+        or marker in title
+        for marker in indicators
+    )
 
 
 # ============================================================
-# CHECK IF REAL ARTICLE LOADED
+# BLOCK RECOVERY
 # ============================================================
 
-def is_article_page_loaded(
-    driver
-):
-
-    try:
-
-        if is_sciencedirect_blocked(
-            driver
-        ):
-
-            return False
-
-        title_elements = (
-            driver.find_elements(
-                By.CSS_SELECTOR,
-                (
-                    "h1.content-title, "
-                    "#screen-reader-main-title"
-                )
-            )
-        )
-
-        publication = (
-            driver.find_elements(
-                By.CSS_SELECTOR,
-                ".publication-title"
-            )
-        )
-
-        return bool(
-            title_elements
-            and publication
-        )
-
-    except Exception:
-
-        return False
-
-
-# ============================================================
-# AUTOMATIC BLOCK WAIT / RETRY
-# ============================================================
-
-def wait_and_retry_blocked_url(
+def restart_after_sciencedirect_block(
     driver,
-    url,
+    blocked_url,
     records,
     completed_articles
 ):
@@ -574,17 +726,24 @@ def wait_and_retry_blocked_url(
     print(
         "=" * 100
     )
-
     print(
         "SCIENCEDIRECT BLOCK DETECTED"
     )
-
     print(
         "=" * 100
     )
 
     print(
-        "Saving current progress..."
+        f"Blocked URL:"
+    )
+
+    print(
+        blocked_url
+    )
+
+    print()
+    print(
+        "Saving checkpoint and Excel..."
     )
 
     save_checkpoint(
@@ -597,109 +756,130 @@ def wait_and_retry_blocked_url(
     )
 
     for (
-        retry_number,
-        delay_seconds
+        attempt,
+        wait_seconds
     ) in enumerate(
-        BLOCK_BACKOFF_STEPS,
+        BLOCK_RESTART_WAITS,
         start=1
     ):
 
         print()
         print(
-            "-" * 100
+            "=" * 100
         )
 
         print(
-            f"Block retry "
-            f"{retry_number}/"
-            f"{MAX_BLOCK_RETRIES}"
+            f"BLOCK RECOVERY "
+            f"{attempt}/"
+            f"{MAX_BLOCK_RESTARTS}"
         )
+
+        print(
+            "=" * 100
+        )
+
+        # ====================================================
+        # CLOSE OLD CHROME
+        # ====================================================
+
+        close_sciencedirect_chrome(
+            driver
+        )
+
+        driver = None
+
+        # ====================================================
+        # WAIT
+        # ====================================================
 
         print(
             f"Waiting "
-            f"{delay_seconds} seconds..."
+            f"{wait_seconds // 60} minute(s) "
+            f"before restarting Chrome..."
         )
 
-        print(
-            "-" * 100
+        remaining = (
+            wait_seconds
         )
 
-        time.sleep(
-            delay_seconds
-        )
+        while remaining > 0:
 
-        # ----------------------------------------------------
-        # CHECK BROWSER
-        # ----------------------------------------------------
+            step = min(
+                30,
+                remaining
+            )
 
-        if not driver_is_alive(
-            driver
-        ):
+            time.sleep(
+                step
+            )
 
-            try:
+            remaining -= step
 
-                driver = (
-                    reconnect_to_chrome(
-                        driver
-                    )
+            if remaining > 0:
+
+                print(
+                    f"    "
+                    f"{remaining}s remaining..."
                 )
 
-            except Exception:
-
-                raise BrowserSessionLost(
-                    "Chrome disappeared during block cooldown."
-                )
-
-        # ----------------------------------------------------
-        # RETRY SAME URL ONCE
-        # ----------------------------------------------------
+        # ====================================================
+        # START FRESH CHROME
+        # ====================================================
 
         try:
 
+            start_sciencedirect_chrome()
+
+            driver = (
+                connect_to_chrome()
+            )
+
+        except Exception as exc:
+
             print(
-                f"Retrying: {url}"
+                f"Chrome restart failed: "
+                f"{exc}"
+            )
+
+            continue
+
+        # ====================================================
+        # RETRY SAME URL
+        # ====================================================
+
+        try:
+
+            print()
+            print(
+                "Retrying same URL:"
+            )
+
+            print(
+                blocked_url
             )
 
             driver.get(
-                url
+                blocked_url
             )
 
             random_wait(
                 PAGE_LOAD_WAIT_MIN,
                 PAGE_LOAD_WAIT_MAX,
-                "Waiting after retry"
+                "Retry page load wait"
             )
 
-        except (
-            NoSuchWindowException,
-            InvalidSessionIdException,
-        ):
+        except Exception as exc:
 
-            driver = (
-                reconnect_to_chrome(
-                    driver
-                )
+            print(
+                f"Retry navigation error: "
+                f"{exc}"
             )
 
             continue
 
-        except WebDriverException:
-
-            if not driver_is_alive(
-                driver
-            ):
-
-                driver = (
-                    reconnect_to_chrome(
-                        driver
-                    )
-                )
-
-            continue
-
-        # ----------------------------------------------------
+        # ====================================================
         # ACCESS RESTORED
-        # ----------------------------------------------------
+        # ====================================================
 
         if not is_sciencedirect_blocked(
             driver
@@ -707,7 +887,15 @@ def wait_and_retry_blocked_url(
 
             print()
             print(
-                "ScienceDirect access restored."
+                "=" * 100
+            )
+
+            print(
+                "SCIENCEDIRECT ACCESS RESTORED"
+            )
+
+            print(
+                "=" * 100
             )
 
             return (
@@ -715,8 +903,9 @@ def wait_and_retry_blocked_url(
                 True
             )
 
+        print()
         print(
-            "Still blocked."
+            "Fresh Chrome is still blocked."
         )
 
         save_checkpoint(
@@ -725,7 +914,7 @@ def wait_and_retry_blocked_url(
         )
 
     # ========================================================
-    # FAILED ALL RETRIES
+    # ALL ATTEMPTS FAILED
     # ========================================================
 
     print()
@@ -734,7 +923,7 @@ def wait_and_retry_blocked_url(
     )
 
     print(
-        "SCIENCEDIRECT REMAINED BLOCKED"
+        "BLOCK RECOVERY FAILED"
     )
 
     print(
@@ -742,11 +931,7 @@ def wait_and_retry_blocked_url(
     )
 
     print(
-        "Progress has been saved."
-    )
-
-    print(
-        "Current URL remains unfinished."
+        "Current article was NOT marked completed."
     )
 
     return (
@@ -756,7 +941,7 @@ def wait_and_retry_blocked_url(
 
 
 # ============================================================
-# OPEN URL
+# OPEN PAGE
 # ============================================================
 
 def open_page(
@@ -768,17 +953,30 @@ def open_page(
     maximum_wait=PAGE_LOAD_WAIT_MAX,
 ):
 
+    # ========================================================
+    # ENSURE CHROME EXISTS
+    # ========================================================
+
     if not driver_is_alive(
         driver
     ):
 
-        driver = reconnect_to_chrome(
-            driver
+        if not chrome_debug_port_open():
+
+            start_sciencedirect_chrome()
+
+        driver = (
+            connect_to_chrome()
         )
 
+    print()
     print(
         f"Opening: {url}"
     )
+
+    # ========================================================
+    # NAVIGATE
+    # ========================================================
 
     try:
 
@@ -791,8 +989,14 @@ def open_page(
         InvalidSessionIdException,
     ):
 
-        driver = reconnect_to_chrome(
+        close_sciencedirect_chrome(
             driver
+        )
+
+        start_sciencedirect_chrome()
+
+        driver = (
+            connect_to_chrome()
         )
 
         driver.get(
@@ -805,10 +1009,14 @@ def open_page(
             driver
         ):
 
+            close_sciencedirect_chrome(
+                driver
+            )
+
+            start_sciencedirect_chrome()
+
             driver = (
-                reconnect_to_chrome(
-                    driver
-                )
+                connect_to_chrome()
             )
 
             driver.get(
@@ -830,7 +1038,7 @@ def open_page(
     )
 
     # ========================================================
-    # BLOCK HANDLING
+    # BLOCK
     # ========================================================
 
     if is_sciencedirect_blocked(
@@ -840,7 +1048,7 @@ def open_page(
         (
             driver,
             recovered
-        ) = wait_and_retry_blocked_url(
+        ) = restart_after_sciencedirect_block(
             driver,
             url,
             records,
@@ -851,14 +1059,14 @@ def open_page(
 
             raise ScienceDirectBlocked(
                 "ScienceDirect remained blocked "
-                "after all cooldown retries."
+                "after all Chrome restart attempts."
             )
 
     return driver
 
 
 # ============================================================
-# SCROLL
+# SCROLL ISSUE PAGE
 # ============================================================
 
 def scroll_page(
@@ -933,12 +1141,16 @@ def extract_issue_links(
     )
 
     print(
-        journal["url"]
+        journal[
+            "url"
+        ]
     )
 
     driver = open_page(
         driver,
-        journal["url"],
+        journal[
+            "url"
+        ],
         records,
         completed_articles
     )
@@ -985,6 +1197,30 @@ def extract_issue_links(
             if href in seen:
 
                 continue
+
+            text = clean_text(
+                anchor.text
+            )
+
+            possible_year = (
+                extract_year(
+                    text
+                )
+            )
+
+            if possible_year:
+
+                if not (
+                    journal[
+                        "start_year"
+                    ]
+                    <= possible_year
+                    <= journal[
+                        "end_year"
+                    ]
+                ):
+
+                    continue
 
             seen.add(
                 href
@@ -1034,7 +1270,9 @@ def extract_issue_metadata(
             result[
                 "journal"
             ] = clean_text(
-                elements[0].text
+                elements[
+                    0
+                ].text
             )
 
     except Exception:
@@ -1066,7 +1304,7 @@ def extract_issue_metadata(
         current_url = ""
 
     # --------------------------------------------------------
-    # URL VOLUME / ISSUE
+    # VOLUME / ISSUE FROM URL
     # --------------------------------------------------------
 
     match = re.search(
@@ -1094,9 +1332,11 @@ def extract_issue_metadata(
     # --------------------------------------------------------
 
     match = re.search(
-        r"(January|February|March|April|May|June|"
-        r"July|August|September|October|November|December)"
-        r"\s+(20\d{2})",
+        (
+            r"(January|February|March|April|May|June|"
+            r"July|August|September|October|November|December)"
+            r"\s+(20\d{2})"
+        ),
         body_text,
         re.I
     )
@@ -1106,13 +1346,17 @@ def extract_issue_metadata(
         result[
             "date"
         ] = clean_text(
-            match.group(0)
+            match.group(
+                0
+            )
         )
 
         result[
             "year"
         ] = int(
-            match.group(2)
+            match.group(
+                2
+            )
         )
 
     else:
@@ -1130,7 +1374,7 @@ def extract_issue_metadata(
 
 
 # ============================================================
-# ARTICLE URLS FROM ISSUE
+# ARTICLE URLS
 # ============================================================
 
 def extract_article_urls(
@@ -1207,6 +1451,7 @@ def extract_article_title(
             ".title-text"
         ),
         "h1.content-title",
+        "h1",
     ]
 
     for selector in selectors:
@@ -1317,7 +1562,9 @@ def extract_article_metadata(
             result[
                 "journal"
             ] = clean_text(
-                elements[0].text
+                elements[
+                    0
+                ].text
             )
 
     except Exception:
@@ -1337,25 +1584,36 @@ def extract_article_metadata(
 
     except Exception:
 
-        pass
+        try:
+
+            metadata_text = (
+                driver.find_element(
+                    By.TAG_NAME,
+                    "body"
+                ).text
+            )
+
+        except Exception:
+
+            pass
 
     # --------------------------------------------------------
     # DATE
     # --------------------------------------------------------
 
-    date_match = re.search(
+    match = re.search(
         r"Date:\s*"
         r"([A-Za-z]+\s+20\d{2})",
         metadata_text,
         re.I
     )
 
-    if date_match:
+    if match:
 
         result[
             "date"
         ] = clean_text(
-            date_match.group(
+            match.group(
                 1
             )
         )
@@ -1364,7 +1622,9 @@ def extract_article_metadata(
         "year"
     ] = (
         extract_year(
-            result["date"]
+            result[
+                "date"
+            ]
         )
         or ""
     )
@@ -1373,26 +1633,28 @@ def extract_article_metadata(
     # VOLUME / ISSUE
     # --------------------------------------------------------
 
-    volume_issue = re.search(
-        r"Volume\s*:?\s*"
-        r"(?:Volume\s*)?"
-        r"(\d+)"
-        r"\s*,?\s*Issue\s+(\d+)",
+    match = re.search(
+        (
+            r"Volume\s*:?\s*"
+            r"(?:Volume\s*)?"
+            r"(\d+)"
+            r"\s*,?\s*Issue\s+(\d+)"
+        ),
         metadata_text,
         re.I
     )
 
-    if volume_issue:
+    if match:
 
         result[
             "volume"
-        ] = volume_issue.group(
+        ] = match.group(
             1
         )
 
         result[
             "issue"
-        ] = volume_issue.group(
+        ] = match.group(
             2
         )
 
@@ -1406,7 +1668,7 @@ def extract_article_metadata(
 
 
 # ============================================================
-# AUTHOR NAME CLEANUP
+# AUTHOR CLEANING
 # ============================================================
 
 def clean_author_name(
@@ -1477,7 +1739,10 @@ def clean_author_name(
                 " ,"
             )
 
-            if updated != name:
+            if (
+                updated
+                != name
+            ):
 
                 name = updated
 
@@ -1516,17 +1781,19 @@ def author_name_from_button(
 
     try:
 
-        given = (
+        elements = (
             button.find_elements(
                 By.CSS_SELECTOR,
                 ".given-name"
             )
         )
 
-        if given:
+        if elements:
 
             given_name = clean_text(
-                given[0].text
+                elements[
+                    0
+                ].text
             )
 
     except Exception:
@@ -1535,17 +1802,17 @@ def author_name_from_button(
 
     try:
 
-        surname_elements = (
+        elements = (
             button.find_elements(
                 By.CSS_SELECTOR,
                 ".surname"
             )
         )
 
-        if surname_elements:
+        if elements:
 
             surname = clean_text(
-                surname_elements[
+                elements[
                     0
                 ].text
             )
@@ -1575,7 +1842,7 @@ def author_name_from_button(
 
 
 # ============================================================
-# EMAIL ICON
+# CONTACT ICON
 # ============================================================
 
 def author_has_email_icon(
@@ -1633,35 +1900,6 @@ def author_has_email_icon(
 # AUTHOR PANEL
 # ============================================================
 
-def find_author_panel(
-    driver
-):
-
-    try:
-
-        panels = (
-            driver.find_elements(
-                By.CSS_SELECTOR,
-                (
-                    "#side-panel."
-                    "side-panel-is-expanded"
-                )
-            )
-        )
-
-        for panel in panels:
-
-            if panel.is_displayed():
-
-                return panel
-
-    except Exception:
-
-        pass
-
-    return None
-
-
 def wait_for_author_panel(
     driver
 ):
@@ -1689,7 +1927,7 @@ def wait_for_author_panel(
 
 
 # ============================================================
-# EMAIL
+# EMAIL FROM PANEL
 # ============================================================
 
 def wait_for_author_email(
@@ -1709,6 +1947,10 @@ def wait_for_author_email(
         ensure_driver_alive(
             driver
         )
+
+        # ----------------------------------------------------
+        # EXACT MAILTO
+        # ----------------------------------------------------
 
         try:
 
@@ -1743,7 +1985,9 @@ def wait_for_author_email(
                         "mailto:",
                         ""
                     )
-                    .split("?")[0]
+                    .split(
+                        "?"
+                    )[0]
                     .strip()
                     .lower()
                 )
@@ -1757,6 +2001,10 @@ def wait_for_author_email(
         except Exception:
 
             pass
+
+        # ----------------------------------------------------
+        # TEXT FALLBACK
+        # ----------------------------------------------------
 
         try:
 
@@ -1783,7 +2031,9 @@ def wait_for_author_email(
                 if matches:
 
                     return (
-                        matches[0]
+                        matches[
+                            0
+                        ]
                         .strip()
                         .lower()
                     )
@@ -1800,7 +2050,7 @@ def wait_for_author_email(
 
 
 # ============================================================
-# PANEL AUTHOR
+# PANEL AUTHOR NAME
 # ============================================================
 
 def extract_panel_author_name(
@@ -1822,7 +2072,9 @@ def extract_panel_author_name(
         )
 
         return clean_author_name(
-            element.text
+            clean_text(
+                element.text
+            )
         )
 
     except Exception:
@@ -1913,7 +2165,10 @@ def extract_correspondence_address(
                 continue
 
             text = re.sub(
-                r"^Address correspondence to\s*:\s*",
+                (
+                    r"^Address correspondence "
+                    r"to\s*:\s*"
+                ),
                 "",
                 text,
                 flags=re.I
@@ -2037,20 +2292,26 @@ def open_author_panel(
         driver
     )
 
-    buttons = get_author_buttons(
-        driver
+    buttons = (
+        get_author_buttons(
+            driver
+        )
     )
 
     if (
         author_index
-        >= len(buttons)
+        >= len(
+            buttons
+        )
     ):
 
         return None
 
-    button = buttons[
-        author_index
-    ]
+    button = (
+        buttons[
+            author_index
+        ]
+    )
 
     driver.execute_script(
         """
@@ -2078,7 +2339,7 @@ def open_author_panel(
 
 
 # ============================================================
-# ARTICLE AUTHORS
+# EXTRACT AUTHORS
 # ============================================================
 
 def extract_article_authors(
@@ -2087,8 +2348,10 @@ def extract_article_authors(
 
     results = []
 
-    buttons = get_author_buttons(
-        driver
+    buttons = (
+        get_author_buttons(
+            driver
+        )
     )
 
     total_authors = len(
@@ -2108,19 +2371,27 @@ def extract_article_authors(
             driver
         )
 
-        buttons = get_author_buttons(
-            driver
+        # React can recreate author elements.
+        buttons = (
+            get_author_buttons(
+                driver
+            )
         )
 
-        if index >= len(
-            buttons
+        if (
+            index
+            >= len(
+                buttons
+            )
         ):
 
             break
 
-        button = buttons[
-            index
-        ]
+        button = (
+            buttons[
+                index
+            ]
+        )
 
         author_name = (
             author_name_from_button(
@@ -2161,7 +2432,7 @@ def extract_article_authors(
         correspondence_address = ""
 
         # ----------------------------------------------------
-        # NO CONTACT ICON
+        # NO EMAIL ICON
         # ----------------------------------------------------
 
         if not has_contact_icon:
@@ -2211,14 +2482,10 @@ def extract_article_authors(
                 )
             )
 
-            # -----------------------------------------------
-            # RETRY ONCE
-            # -----------------------------------------------
-
             if panel is None:
 
                 print(
-                    "          First panel click failed."
+                    "          First panel attempt failed."
                 )
 
                 close_author_panel(
@@ -2249,7 +2516,7 @@ def extract_article_authors(
                 )
 
                 # --------------------------------------------
-                # PANEL NAME
+                # AUTHOR NAME FROM PANEL
                 # --------------------------------------------
 
                 panel_author = (
@@ -2418,11 +2685,13 @@ def parse_article(
         f"ARTICLE: {article_url}"
     )
 
-    driver = open_page(
-        driver,
-        article_url,
-        records,
-        completed_articles
+    driver = (
+        open_page(
+            driver,
+            article_url,
+            records,
+            completed_articles
+        )
     )
 
     ensure_driver_alive(
@@ -2430,7 +2699,7 @@ def parse_article(
     )
 
     # --------------------------------------------------------
-    # ARTICLE WAIT
+    # WAIT FOR ARTICLE DOM
     # --------------------------------------------------------
 
     try:
@@ -2444,7 +2713,8 @@ def parse_article(
                     By.CSS_SELECTOR,
                     (
                         "h1.content-title, "
-                        "#screen-reader-main-title"
+                        "#screen-reader-main-title, "
+                        "h1"
                     )
                 )
             )
@@ -2459,11 +2729,13 @@ def parse_article(
     ):
 
         raise ScienceDirectBlocked(
-            "Article is still blocked."
+            "Article remained blocked."
         )
 
-    title = extract_article_title(
-        driver
+    title = (
+        extract_article_title(
+            driver
+        )
     )
 
     metadata = (
@@ -2473,7 +2745,7 @@ def parse_article(
     )
 
     # --------------------------------------------------------
-    # FALLBACKS
+    # FALLBACK TO ISSUE DATA
     # --------------------------------------------------------
 
     if not metadata[
@@ -2652,20 +2924,25 @@ def parse_article(
 
 def load_checkpoint():
 
-    data = load_json(
-        CHECKPOINT_FILE
+    data = (
+        load_json(
+            CHECKPOINT_FILE
+        )
     )
 
-    records = data.get(
-        "records",
-        []
+    records = (
+        data.get(
+            "records",
+            []
+        )
     )
 
     completed_articles = set(
         normalize_url(
             url
         )
-        for url in data.get(
+        for url
+        in data.get(
             "completed_articles",
             []
         )
@@ -2702,7 +2979,7 @@ def save_checkpoint(
 
 
 # ============================================================
-# REMOVE OLD ARTICLE DATA
+# REMOVE OLD ARTICLE RECORDS
 # ============================================================
 
 def remove_article_records(
@@ -2710,15 +2987,18 @@ def remove_article_records(
     article_url
 ):
 
-    article_url = normalize_url(
-        article_url
+    article_url = (
+        normalize_url(
+            article_url
+        )
     )
 
     return [
-        row
-        for row in records
+        record
+        for record
+        in records
         if normalize_url(
-            row.get(
+            record.get(
                 "article_url",
                 ""
             )
@@ -2728,7 +3008,7 @@ def remove_article_records(
 
 
 # ============================================================
-# REPROCESS CHECK
+# REPROCESS MISSING EMAIL
 # ============================================================
 
 def article_needs_reprocess(
@@ -2736,13 +3016,16 @@ def article_needs_reprocess(
     records
 ):
 
-    article_url = normalize_url(
-        article_url
+    article_url = (
+        normalize_url(
+            article_url
+        )
     )
 
     rows = [
         row
-        for row in records
+        for row
+        in records
         if normalize_url(
             row.get(
                 "article_url",
@@ -2752,8 +3035,7 @@ def article_needs_reprocess(
         == article_url
     ]
 
-    # If article is in completed list and contains zero
-    # author rows, it may legitimately be an ad/TOC/etc.
+    # Legitimate non-author pages
     if not rows:
 
         return False
@@ -2783,7 +3065,8 @@ def article_needs_reprocess(
 
         if (
             contact == "yes"
-            and not email
+            and
+            not email
         ):
 
             return True
@@ -2802,7 +3085,7 @@ def save_excel(
     if not records:
 
         print(
-            "No author records to write."
+            "No author records available for Excel."
         )
 
         return
@@ -2884,7 +3167,7 @@ def save_excel(
     )
 
     # --------------------------------------------------------
-    # EMAIL ONLY
+    # EMAIL-ONLY SHEET
     # --------------------------------------------------------
 
     email_df = (
@@ -2932,7 +3215,7 @@ def save_excel(
     )
 
     # --------------------------------------------------------
-    # EXCEL
+    # WRITE
     # --------------------------------------------------------
 
     with pd.ExcelWriter(
@@ -2952,7 +3235,9 @@ def save_excel(
             index=False
         )
 
-        workbook = writer.book
+        workbook = (
+            writer.book
+        )
 
         widths = {
             "A": 45,
@@ -3032,8 +3317,10 @@ def main():
         completed_articles
     ) = load_checkpoint()
 
-    errors = load_json(
-        ERROR_FILE
+    errors = (
+        load_json(
+            ERROR_FILE
+        )
     )
 
     if not isinstance(
@@ -3077,6 +3364,12 @@ def main():
 
     try:
 
+        # ====================================================
+        # START DEDICATED CHROME
+        # ====================================================
+
+        start_sciencedirect_chrome()
+
         driver = (
             connect_to_chrome()
         )
@@ -3113,6 +3406,10 @@ def main():
             print(
                 "=" * 110
             )
+
+            # ------------------------------------------------
+            # ISSUE LIST
+            # ------------------------------------------------
 
             (
                 driver,
@@ -3152,13 +3449,15 @@ def main():
                     issue_url
                 )
 
-                driver = open_page(
-                    driver,
-                    issue_url,
-                    records,
-                    completed_articles,
-                    ISSUE_LOAD_WAIT_MIN,
-                    ISSUE_LOAD_WAIT_MAX
+                driver = (
+                    open_page(
+                        driver,
+                        issue_url,
+                        records,
+                        completed_articles,
+                        ISSUE_LOAD_WAIT_MIN,
+                        ISSUE_LOAD_WAIT_MAX
+                    )
                 )
 
                 issue_metadata = (
@@ -3201,8 +3500,10 @@ def main():
 
                     try:
 
-                        issue_year_int = int(
-                            issue_year
+                        issue_year_int = (
+                            int(
+                                issue_year
+                            )
                         )
 
                     except Exception:
@@ -3211,7 +3512,8 @@ def main():
 
                     if (
                         issue_year_int
-                        and not (
+                        and
+                        not (
                             journal[
                                 "start_year"
                             ]
@@ -3230,7 +3532,7 @@ def main():
                         continue
 
                 # --------------------------------------------
-                # ARTICLES
+                # ARTICLE URLS
                 # --------------------------------------------
 
                 article_urls = (
@@ -3243,6 +3545,10 @@ def main():
                     f"Articles found: "
                     f"{len(article_urls)}"
                 )
+
+                # ============================================
+                # ARTICLES
+                # ============================================
 
                 for (
                     article_index,
@@ -3296,7 +3602,8 @@ def main():
                             f"[Article "
                             f"{article_index}/"
                             f"{len(article_urls)}] "
-                            f"REPROCESSING - missing email"
+                            f"REPROCESSING - "
+                            f"missing contact email"
                         )
 
                     else:
@@ -3329,7 +3636,9 @@ def main():
                     except ScienceDirectBlocked as exc:
 
                         stop_reason = (
-                            str(exc)
+                            str(
+                                exc
+                            )
                         )
 
                         print()
@@ -3346,12 +3655,7 @@ def main():
                         )
 
                         print(
-                            "The current article was NOT "
-                            "marked completed."
-                        )
-
-                        print(
-                            "Stopping safely."
+                            "Article NOT marked completed."
                         )
 
                         raise
@@ -3359,7 +3663,9 @@ def main():
                     except BrowserSessionLost as exc:
 
                         stop_reason = (
-                            str(exc)
+                            str(
+                                exc
+                            )
                         )
 
                         print(
@@ -3375,6 +3681,10 @@ def main():
                             f"ARTICLE ERROR: "
                             f"{exc}"
                         )
+
+                        # ------------------------------------
+                        # NEVER MARK FAILED ARTICLE COMPLETED
+                        # ------------------------------------
 
                         completed_articles.discard(
                             article_url
@@ -3420,8 +3730,7 @@ def main():
                     # ARTICLE SUCCESS
                     # ========================================
 
-                    # Do not remove old article rows until
-                    # the new scrape completed successfully.
+                    # Only now replace previous records.
 
                     records = (
                         remove_article_records(
@@ -3444,8 +3753,10 @@ def main():
 
                             try:
 
-                                row_year_int = int(
-                                    row_year
+                                row_year_int = (
+                                    int(
+                                        row_year
+                                    )
                                 )
 
                             except Exception:
@@ -3454,7 +3765,8 @@ def main():
 
                             if (
                                 row_year_int
-                                and not (
+                                and
+                                not (
                                     journal[
                                         "start_year"
                                     ]
@@ -3475,6 +3787,10 @@ def main():
                         accepted_records
                     )
 
+                    # ----------------------------------------
+                    # MARK COMPLETED ONLY AFTER SUCCESS
+                    # ----------------------------------------
+
                     completed_articles.add(
                         article_url
                     )
@@ -3486,7 +3802,7 @@ def main():
                     )
 
                     # ----------------------------------------
-                    # CHECKPOINT AFTER EVERY SUCCESS
+                    # CHECKPOINT EVERY ARTICLE
                     # ----------------------------------------
 
                     save_checkpoint(
@@ -3495,7 +3811,7 @@ def main():
                     )
 
                     # ----------------------------------------
-                    # EXCEL PERIODIC
+                    # PERIODIC EXCEL
                     # ----------------------------------------
 
                     if (
@@ -3509,7 +3825,7 @@ def main():
                         )
 
                     # ----------------------------------------
-                    # COOLDOWN
+                    # PERIODIC COOLDOWN
                     # ----------------------------------------
 
                     if (
@@ -3588,7 +3904,8 @@ def main():
     except Exception as exc:
 
         stop_reason = (
-            f"Fatal error: {exc}"
+            f"Fatal error: "
+            f"{exc}"
         )
 
         print()
@@ -3639,7 +3956,8 @@ def main():
 
         email_count = sum(
             1
-            for record in records
+            for record
+            in records
             if str(
                 record.get(
                     "email",
