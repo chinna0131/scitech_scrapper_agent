@@ -3,7 +3,6 @@ import re
 import json
 import time
 from datetime import datetime
-from urllib.parse import urljoin
 
 import pandas as pd
 
@@ -44,7 +43,6 @@ ERROR_FILE = os.path.join(
     "errors.json"
 )
 
-
 REMOTE_DEBUGGING_ADDRESS = "127.0.0.1:9222"
 
 PAGE_LOAD_WAIT = 4
@@ -58,6 +56,8 @@ AUTHOR_PANEL_OPEN_TIMEOUT = 15
 AUTHOR_EMAIL_TIMEOUT = 25
 
 AUTHOR_EMAIL_POLL_INTERVAL = 0.5
+
+SAVE_EVERY_N_ARTICLES = 10
 
 
 # ============================================================
@@ -118,27 +118,21 @@ YEAR_RE = re.compile(
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def clean_text(value):
-
     if value is None:
         return ""
 
-    value = str(value)
-
-    value = re.sub(
+    return re.sub(
         r"\s+",
         " ",
-        value
-    )
-
-    return value.strip()
+        str(value)
+    ).strip()
 
 
 def normalize_url(url):
-
     if not url:
         return ""
 
@@ -149,7 +143,6 @@ def normalize_url(url):
 
 
 def extract_year(text):
-
     if not text:
         return None
 
@@ -161,18 +154,14 @@ def extract_year(text):
         return None
 
     try:
-
         return int(
             match.group(1)
         )
-
     except Exception:
-
         return None
 
 
 def save_json(path, data):
-
     with open(
         path,
         "w",
@@ -188,12 +177,10 @@ def save_json(path, data):
 
 
 def load_json(path):
-
     if not os.path.exists(path):
         return {}
 
     try:
-
         with open(
             path,
             "r",
@@ -205,7 +192,6 @@ def load_json(path):
             )
 
     except Exception:
-
         return {}
 
 
@@ -214,7 +200,6 @@ def load_json(path):
 # ============================================================
 
 def connect_to_chrome():
-
     options = Options()
 
     options.add_experimental_option(
@@ -239,20 +224,17 @@ def connect_to_chrome():
 
 
 # ============================================================
-# SCIENCEDIRECT BLOCK DETECTION
+# BLOCK DETECTION
 # ============================================================
 
 def is_blocked(driver):
-
     try:
-
         source = (
             driver.page_source
             or ""
         ).lower()
 
     except Exception:
-
         return False
 
     indicators = [
@@ -270,33 +252,29 @@ def is_blocked(driver):
 
 
 def wait_for_manual_access(driver):
-
     print()
     print("=" * 100)
     print("SCIENCEDIRECT ACCESS/BLOCK PAGE DETECTED")
     print("=" * 100)
 
     print(
-        "Open/check the Chrome window manually."
+        "Check the open Chrome window manually."
     )
 
     print(
-        "When the real ScienceDirect page becomes visible, "
-        "the scraper will continue."
+        "Once the real ScienceDirect page is visible, "
+        "the scraper will continue automatically."
     )
 
     while True:
 
         try:
-
             if not is_blocked(
                 driver
             ):
-
                 print(
                     "ScienceDirect content detected. Continuing..."
                 )
-
                 return True
 
         except Exception:
@@ -308,7 +286,7 @@ def wait_for_manual_access(driver):
 
 
 # ============================================================
-# OPEN PAGE
+# PAGE OPEN
 # ============================================================
 
 def open_page(
@@ -316,23 +294,19 @@ def open_page(
     url,
     wait_seconds=PAGE_LOAD_WAIT
 ):
-
     print(
         f"Opening: {url}"
     )
 
     try:
-
         driver.get(
             url
         )
 
     except WebDriverException as exc:
-
         print(
             f"Browser error: {exc}"
         )
-
         return False
 
     time.sleep(
@@ -342,7 +316,6 @@ def open_page(
     if is_blocked(
         driver
     ):
-
         wait_for_manual_access(
             driver
         )
@@ -358,7 +331,6 @@ def scroll_page(
     driver,
     max_scrolls=15
 ):
-
     previous_height = 0
 
     for _ in range(
@@ -366,17 +338,13 @@ def scroll_page(
     ):
 
         try:
-
             current_height = (
                 driver.execute_script(
                     "return document.body.scrollHeight"
                 )
             )
 
-            if (
-                current_height
-                == previous_height
-            ):
+            if current_height == previous_height:
                 break
 
             driver.execute_script(
@@ -401,14 +369,13 @@ def scroll_page(
 
 
 # ============================================================
-# GET ISSUE LINKS
+# ISSUE LINKS
 # ============================================================
 
 def extract_issue_links(
     driver,
     journal
 ):
-
     print()
     print(
         "Opening journal issues page:"
@@ -422,7 +389,6 @@ def extract_issue_links(
         driver,
         journal["url"]
     ):
-
         return []
 
     scroll_page(
@@ -446,7 +412,6 @@ def extract_issue_links(
     for anchor in anchors:
 
         try:
-
             href = (
                 anchor.get_attribute(
                     "href"
@@ -468,20 +433,21 @@ def extract_issue_links(
                 anchor.text
             )
 
-            possible_year = (
-                extract_year(
-                    text
-                )
+            possible_year = extract_year(
+                text
             )
 
             if possible_year:
 
                 if not (
-                    journal["start_year"]
+                    journal[
+                        "start_year"
+                    ]
                     <= possible_year
-                    <= journal["end_year"]
+                    <= journal[
+                        "end_year"
+                    ]
                 ):
-
                     continue
 
             seen.add(
@@ -505,7 +471,6 @@ def extract_issue_links(
 def extract_issue_metadata(
     driver
 ):
-
     result = {
         "journal": "",
         "year": "",
@@ -514,19 +479,13 @@ def extract_issue_metadata(
         "issue": "",
     }
 
-    # --------------------------------------------------------
-    # JOURNAL
-    # --------------------------------------------------------
-
     try:
-
         elements = driver.find_elements(
             By.CSS_SELECTOR,
             ".publication-title"
         )
 
         if elements:
-
             result[
                 "journal"
             ] = clean_text(
@@ -536,24 +495,18 @@ def extract_issue_metadata(
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # PAGE TEXT
-    # --------------------------------------------------------
-
     try:
-
-        body_text = (
-            driver.find_element(
-                By.TAG_NAME,
-                "body"
-            ).text
-        )
+        body_text = driver.find_element(
+            By.TAG_NAME,
+            "body"
+        ).text
 
     except Exception:
-
         body_text = ""
 
-    # Date
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
 
     match = re.search(
         r"Date:\s*([A-Za-z]+\s+20\d{2})",
@@ -562,7 +515,6 @@ def extract_issue_metadata(
     )
 
     if match:
-
         result[
             "date"
         ] = clean_text(
@@ -573,7 +525,9 @@ def extract_issue_metadata(
         "year"
     ] = (
         extract_year(
-            result["date"]
+            result[
+                "date"
+            ]
         )
         or
         extract_year(
@@ -582,25 +536,27 @@ def extract_issue_metadata(
         or ""
     )
 
-    # Volume/Issue
+    # --------------------------------------------------------
+    # VOLUME / ISSUE
+    # --------------------------------------------------------
 
-    volume_issue_match = re.search(
+    match = re.search(
         r"Volume\s+(\d+)\s*,?\s*Issue\s+(\d+)",
         body_text,
         re.I
     )
 
-    if volume_issue_match:
+    if match:
 
         result[
             "volume"
-        ] = volume_issue_match.group(
+        ] = match.group(
             1
         )
 
         result[
             "issue"
-        ] = volume_issue_match.group(
+        ] = match.group(
             2
         )
 
@@ -619,7 +575,6 @@ def extract_issue_metadata(
         )
 
         if volume_match:
-
             result[
                 "volume"
             ] = volume_match.group(
@@ -627,7 +582,6 @@ def extract_issue_metadata(
             )
 
         if issue_match:
-
             result[
                 "issue"
             ] = issue_match.group(
@@ -638,13 +592,12 @@ def extract_issue_metadata(
 
 
 # ============================================================
-# ARTICLE URLS FROM ISSUE PAGE
+# ARTICLE URLS
 # ============================================================
 
 def extract_article_urls(
     driver
 ):
-
     urls = []
 
     seen = set()
@@ -660,7 +613,6 @@ def extract_article_urls(
     for element in elements:
 
         try:
-
             href = (
                 element.get_attribute(
                     "href"
@@ -699,7 +651,6 @@ def extract_article_urls(
 def extract_article_title(
     driver
 ):
-
     selectors = [
         "h1.content-title .title-text",
         "#screen-reader-main-title .title-text",
@@ -710,12 +661,9 @@ def extract_article_title(
     for selector in selectors:
 
         try:
-
-            elements = (
-                driver.find_elements(
-                    By.CSS_SELECTOR,
-                    selector
-                )
+            elements = driver.find_elements(
+                By.CSS_SELECTOR,
+                selector
             )
 
             for element in elements:
@@ -725,7 +673,6 @@ def extract_article_title(
                 )
 
                 if value:
-
                     return value
 
         except Exception:
@@ -741,9 +688,7 @@ def extract_article_title(
 def extract_doi(
     driver
 ):
-
     try:
-
         links = driver.find_elements(
             By.CSS_SELECTOR,
             'a[href*="doi.org/10."]'
@@ -786,7 +731,6 @@ def extract_doi(
 def extract_article_metadata(
     driver
 ):
-
     result = {
         "journal": "",
         "year": "",
@@ -796,10 +740,11 @@ def extract_article_metadata(
         "doi": "",
     }
 
-    # Journal
+    # --------------------------------------------------------
+    # JOURNAL
+    # --------------------------------------------------------
 
     try:
-
         elements = driver.find_elements(
             By.CSS_SELECTOR,
             ".publication-title"
@@ -816,12 +761,13 @@ def extract_article_metadata(
     except Exception:
         pass
 
-    # Metadata text
+    # --------------------------------------------------------
+    # METADATA
+    # --------------------------------------------------------
 
     metadata_text = ""
 
     try:
-
         metadata_text = (
             driver.find_element(
                 By.CSS_SELECTOR,
@@ -832,7 +778,6 @@ def extract_article_metadata(
     except Exception:
 
         try:
-
             metadata_text = (
                 driver.find_element(
                     By.TAG_NAME,
@@ -843,7 +788,9 @@ def extract_article_metadata(
         except Exception:
             pass
 
-    # Date
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
 
     match = re.search(
         r"Date:\s*([A-Za-z]+\s+20\d{2})",
@@ -863,12 +810,16 @@ def extract_article_metadata(
         "year"
     ] = (
         extract_year(
-            result["date"]
+            result[
+                "date"
+            ]
         )
         or ""
     )
 
-    # Volume / Issue together
+    # --------------------------------------------------------
+    # VOLUME / ISSUE
+    # --------------------------------------------------------
 
     match = re.search(
         r"Volume\s+(\d+)\s*,?\s*Issue\s+(\d+)",
@@ -920,6 +871,10 @@ def extract_article_metadata(
                 1
             )
 
+    # --------------------------------------------------------
+    # DOI
+    # --------------------------------------------------------
+
     result[
         "doi"
     ] = extract_doi(
@@ -930,13 +885,12 @@ def extract_article_metadata(
 
 
 # ============================================================
-# AUTHOR NAME CLEANING
+# CLEAN AUTHOR
 # ============================================================
 
 def clean_author_name(
     name
 ):
-
     if not name:
         return ""
 
@@ -987,10 +941,7 @@ def clean_author_name(
                 " ,"
             )
 
-            if (
-                new_name
-                != name
-            ):
+            if new_name != name:
 
                 name = new_name
 
@@ -1008,7 +959,6 @@ def clean_author_name(
 def get_author_buttons(
     driver
 ):
-
     return driver.find_elements(
         By.CSS_SELECTOR,
         (
@@ -1022,19 +972,16 @@ def get_author_buttons(
 def author_name_from_button(
     button
 ):
-
     given_name = ""
     surname = ""
 
     try:
-
         given = button.find_elements(
             By.CSS_SELECTOR,
             ".given-name"
         )
 
         if given:
-
             given_name = clean_text(
                 given[0].text
             )
@@ -1043,14 +990,12 @@ def author_name_from_button(
         pass
 
     try:
-
         surnames = button.find_elements(
             By.CSS_SELECTOR,
             ".surname"
         )
 
         if surnames:
-
             surname = clean_text(
                 surnames[0].text
             )
@@ -1058,36 +1003,46 @@ def author_name_from_button(
     except Exception:
         pass
 
-    if (
-        given_name
-        or surname
-    ):
+    if given_name or surname:
 
         return clean_author_name(
             f"{given_name} {surname}"
         )
 
     try:
-
         return clean_author_name(
             button.text
         )
 
     except Exception:
-
         return ""
 
 
 # ============================================================
-# CONTACT/EMAIL ICON DETECTION
+# CONTACT ICON
 # ============================================================
 
 def author_has_email_icon(
     button
 ):
+    """
+    Exact ScienceDirect contact marker:
+        svg.icon-envelope
+    """
 
     try:
+        icons = button.find_elements(
+            By.CSS_SELECTOR,
+            "svg.icon-envelope"
+        )
 
+        if icons:
+            return True
+
+    except Exception:
+        pass
+
+    try:
         html = (
             button.get_attribute(
                 "outerHTML"
@@ -1095,61 +1050,14 @@ def author_has_email_icon(
             or ""
         ).lower()
 
-        indicators = [
-            "icon-envelope",
-            "author email or social media contact details icon",
-            "email or social media",
-        ]
-
-        if any(
-            x in html
-            for x in indicators
-        ):
-
+        if "icon-envelope" in html:
             return True
 
-    except Exception:
-        pass
-
-    try:
-
-        icons = button.find_elements(
-            By.CSS_SELECTOR,
-            "svg"
-        )
-
-        for icon in icons:
-
-            title = (
-                icon.get_attribute(
-                    "title"
-                )
-                or ""
-            ).lower()
-
-            aria = (
-                icon.get_attribute(
-                    "aria-label"
-                )
-                or ""
-            ).lower()
-
-            css_class = (
-                icon.get_attribute(
-                    "class"
-                )
-                or ""
-            ).lower()
-
-            if (
-                "email" in title
-                or "contact details" in title
-                or "email" in aria
-                or "icon-envelope"
-                in css_class
-            ):
-
-                return True
+        if (
+            "author email or social media contact details icon"
+            in html
+        ):
+            return True
 
     except Exception:
         pass
@@ -1158,218 +1066,60 @@ def author_has_email_icon(
 
 
 # ============================================================
-# FIND AUTHOR SIDE PANEL
+# EXACT AUTHOR PANEL
 # ============================================================
 
 def find_author_panel(
     driver
 ):
+    try:
+        panels = driver.find_elements(
+            By.CSS_SELECTOR,
+            "#side-panel.side-panel-is-expanded"
+        )
 
-    selectors = [
-        '[role="dialog"]',
-        '[class*="side-panel"]',
-        '[class*="sidePanel"]',
-        '[class*="SidePanel"]',
-        '[class*="drawer"]',
-        '[class*="Drawer"]',
-        '[data-testid*="author"]',
-        '[data-testid*="panel"]',
-    ]
+        for panel in panels:
 
-    for selector in selectors:
+            try:
+                if panel.is_displayed():
+                    return panel
 
-        try:
+            except Exception:
+                continue
 
-            elements = driver.find_elements(
-                By.CSS_SELECTOR,
-                selector
-            )
-
-            for element in elements:
-
-                try:
-
-                    if not element.is_displayed():
-                        continue
-
-                    text = clean_text(
-                        element.text
-                    )
-
-                    if not text:
-                        continue
-
-                    lower = text.lower()
-
-                    if (
-                        lower.startswith(
-                            "author"
-                        )
-                        or
-                        "address correspondence to"
-                        in lower
-                        or
-                        "view in scopus"
-                        in lower
-                        or
-                        EMAIL_RE.search(
-                            text
-                        )
-                    ):
-
-                        return element
-
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
+    except Exception:
+        pass
 
     return None
 
-
-# ============================================================
-# WAIT FOR PANEL
-# ============================================================
 
 def wait_for_author_panel(
     driver
 ):
-
-    end_time = (
-        time.time()
-        + AUTHOR_PANEL_OPEN_TIMEOUT
-    )
-
-    while (
-        time.time()
-        < end_time
-    ):
-
-        panel = find_author_panel(
-            driver
-        )
-
-        if panel is not None:
-
-            return panel
-
-        time.sleep(
-            0.25
-        )
-
-    return None
-
-
-# ============================================================
-# FIND EMAIL IN ELEMENT
-# ============================================================
-
-def find_email_in_element(
-    element
-):
-
-    if element is None:
-        return ""
-
-    # mailto
-
     try:
-
-        links = element.find_elements(
-            By.CSS_SELECTOR,
-            'a[href^="mailto:"]'
-        )
-
-        for link in links:
-
-            href = (
-                link.get_attribute(
-                    "href"
+        return WebDriverWait(
+            driver,
+            AUTHOR_PANEL_OPEN_TIMEOUT
+        ).until(
+            EC.visibility_of_element_located(
+                (
+                    By.CSS_SELECTOR,
+                    "#side-panel.side-panel-is-expanded"
                 )
-                or ""
             )
-
-            email = (
-                href
-                .replace(
-                    "mailto:",
-                    ""
-                )
-                .split(
-                    "?"
-                )[0]
-                .strip()
-                .lower()
-            )
-
-            if EMAIL_RE.fullmatch(
-                email
-            ):
-
-                return email
-
-    except Exception:
-        pass
-
-    # visible text
-
-    try:
-
-        matches = EMAIL_RE.findall(
-            element.text
-            or ""
         )
 
-        if matches:
-
-            return (
-                matches[0]
-                .lower()
-                .strip()
-            )
-
-    except Exception:
-        pass
-
-    # outer HTML
-
-    try:
-
-        html = (
-            element.get_attribute(
-                "outerHTML"
-            )
-            or ""
-        )
-
-        matches = EMAIL_RE.findall(
-            html
-        )
-
-        if matches:
-
-            return (
-                matches[0]
-                .lower()
-                .strip()
-            )
-
-    except Exception:
-        pass
-
-    return ""
+    except TimeoutException:
+        return None
 
 
 # ============================================================
-# WAIT FOR EMAIL
+# EMAIL
 # ============================================================
 
 def wait_for_author_email(
-    driver,
-    panel=None
+    driver
 ):
-
     end_time = (
         time.time()
         + AUTHOR_EMAIL_TIMEOUT
@@ -1380,53 +1130,23 @@ def wait_for_author_email(
         < end_time
     ):
 
-        # React may rebuild panel.
-        fresh_panel = (
-            find_author_panel(
-                driver
-            )
-        )
-
-        if fresh_panel is not None:
-
-            panel = fresh_panel
-
-        # -----------------------------------------------
-        # PANEL
-        # -----------------------------------------------
-
-        if panel is not None:
-
-            email = (
-                find_email_in_element(
-                    panel
-                )
-            )
-
-            if email:
-
-                return (
-                    email,
-                    panel
-                )
-
-        # -----------------------------------------------
-        # GLOBAL MAILTO LINKS
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # EXACT EMAIL SELECTOR
+        # ----------------------------------------------------
 
         try:
-
-            mail_links = (
-                driver.find_elements(
-                    By.CSS_SELECTOR,
+            links = driver.find_elements(
+                By.CSS_SELECTOR,
+                (
+                    "#side-panel.side-panel-is-expanded "
+                    ".e-address "
                     'a[href^="mailto:"]'
                 )
             )
 
-            for link in mail_links:
+            for link in links:
 
                 try:
-
                     if not link.is_displayed():
                         continue
 
@@ -1453,11 +1173,7 @@ def wait_for_author_email(
                     if EMAIL_RE.fullmatch(
                         email
                     ):
-
-                        return (
-                            email,
-                            panel
-                        )
+                        return email
 
                 except Exception:
                     continue
@@ -1465,42 +1181,37 @@ def wait_for_author_email(
         except Exception:
             pass
 
-        # -----------------------------------------------
-        # VISIBLE TEXT WITH @
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # E-ADDRESS TEXT FALLBACK
+        # ----------------------------------------------------
 
         try:
-
-            candidates = (
-                driver.find_elements(
-                    By.XPATH,
-                    "//*[contains(text(), '@')]"
+            elements = driver.find_elements(
+                By.CSS_SELECTOR,
+                (
+                    "#side-panel.side-panel-is-expanded "
+                    ".e-address"
                 )
             )
 
-            for candidate in candidates:
+            for element in elements:
 
-                try:
+                text = (
+                    element.text
+                    or ""
+                )
 
-                    if not candidate.is_displayed():
-                        continue
+                matches = EMAIL_RE.findall(
+                    text
+                )
 
-                    matches = EMAIL_RE.findall(
-                        candidate.text
-                        or ""
+                if matches:
+
+                    return (
+                        matches[0]
+                        .strip()
+                        .lower()
                     )
-
-                    if matches:
-
-                        return (
-                            matches[0]
-                            .lower()
-                            .strip(),
-                            panel
-                        )
-
-                except Exception:
-                    continue
 
         except Exception:
             pass
@@ -1509,234 +1220,181 @@ def wait_for_author_email(
             AUTHOR_EMAIL_POLL_INTERVAL
         )
 
-    return (
-        "",
-        panel
-    )
+    return ""
 
 
 # ============================================================
-# EXTRACT AFFILIATION FROM PANEL
+# PANEL AUTHOR NAME
 # ============================================================
 
-def extract_affiliation_from_panel(
-    panel,
-    author_name,
-    email
+def extract_panel_author_name(
+    driver
 ):
-
-    if panel is None:
-        return ""
-
     try:
+        element = driver.find_element(
+            By.CSS_SELECTOR,
+            (
+                "#side-panel.side-panel-is-expanded "
+                ".side-panel-children "
+                ".side-panel-author > h2"
+            )
+        )
 
-        text = (
-            panel.text
-            or ""
+        return clean_author_name(
+            clean_text(
+                element.text
+            )
         )
 
     except Exception:
-
         return ""
 
-    lines = [
-        clean_text(
-            line
-        )
-        for line
-        in text.splitlines()
-        if clean_text(
-            line
-        )
-    ]
-
-    output = []
-
-    for line in lines:
-
-        lower = line.lower()
-
-        if lower == "author":
-            continue
-
-        if (
-            author_name
-            and lower
-            == author_name.lower()
-        ):
-            continue
-
-        if (
-            email
-            and email.lower()
-            in lower
-        ):
-            continue
-
-        if (
-            "view in scopus"
-            in lower
-        ):
-            continue
-
-        if (
-            "orcid"
-            in lower
-        ):
-            continue
-
-        if (
-            lower.startswith(
-                "more documents"
-            )
-        ):
-            break
-
-        if (
-            "provided by scopus"
-            in lower
-        ):
-            break
-
-        line = re.sub(
-            r"^address correspondence to\s*:\s*",
-            "",
-            line,
-            flags=re.I
-        )
-
-        output.append(
-            line
-        )
-
-    return clean_text(
-        " ".join(
-            output
-        )
-    )
-
 
 # ============================================================
-# CLOSE AUTHOR PANEL
+# CORRESPONDENCE ADDRESS
 # ============================================================
 
-def close_author_panel(
+def extract_correspondence_address(
     driver
 ):
+    try:
+        elements = driver.find_elements(
+            By.CSS_SELECTOR,
+            (
+                "#side-panel.side-panel-is-expanded "
+                ".correspondence span"
+            )
+        )
 
-    panel = find_author_panel(
-        driver
-    )
+        for element in elements:
 
-    # Try buttons inside panel first
-
-    if panel is not None:
-
-        try:
-
-            buttons = panel.find_elements(
-                By.TAG_NAME,
-                "button"
+            text = clean_text(
+                element.text
             )
 
-            for button in reversed(
-                buttons
-            ):
+            if not text:
+                continue
 
-                try:
+            text = re.sub(
+                r"^Address correspondence to\s*:\s*",
+                "",
+                text,
+                flags=re.I
+            )
 
-                    if not button.is_displayed():
-                        continue
+            return clean_text(
+                text
+            )
 
-                    aria = (
-                        button.get_attribute(
-                            "aria-label"
-                        )
-                        or ""
-                    ).lower()
+    except Exception:
+        pass
 
-                    title = (
-                        button.get_attribute(
-                            "title"
-                        )
-                        or ""
-                    ).lower()
+    return ""
 
-                    html = (
-                        button.get_attribute(
-                            "outerHTML"
-                        )
-                        or ""
-                    ).lower()
 
-                    if (
-                        "close" in aria
-                        or
-                        "close" in title
-                        or
-                        "icon-close"
-                        in html
-                    ):
+# ============================================================
+# AFFILIATION
+# ============================================================
 
-                        driver.execute_script(
-                            "arguments[0].click();",
-                            button
-                        )
-
-                        time.sleep(
-                            0.6
-                        )
-
-                        return True
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-    # Global close button
-
+def extract_panel_affiliation(
+    driver
+):
     selectors = [
-        'button[aria-label="Close"]',
-        'button[aria-label="close"]',
-        'button[title="Close"]',
-        'button[title="close"]',
+        (
+            "#side-panel.side-panel-is-expanded "
+            ".side-panel-children > "
+            ".side-panel-author > "
+            ".affiliation"
+        ),
+        (
+            "#side-panel.side-panel-is-expanded "
+            ".affiliation"
+        ),
     ]
 
     for selector in selectors:
 
         try:
-
-            buttons = driver.find_elements(
+            elements = driver.find_elements(
                 By.CSS_SELECTOR,
                 selector
             )
 
-            for button in reversed(
-                buttons
-            ):
+            for element in elements:
 
-                if button.is_displayed():
+                text = clean_text(
+                    element.text
+                )
 
-                    driver.execute_script(
-                        "arguments[0].click();",
-                        button
-                    )
-
-                    time.sleep(
-                        0.6
-                    )
-
-                    return True
+                if text:
+                    return text
 
         except Exception:
-            pass
+            continue
 
-    # Escape fallback
+    return ""
+
+
+# ============================================================
+# CLOSE PANEL
+# ============================================================
+
+def close_author_panel(
+    driver
+):
+    try:
+        buttons = driver.find_elements(
+            By.CSS_SELECTOR,
+            (
+                "#side-panel "
+                "button.side-panel-close-btn"
+            )
+        )
+
+        for button in buttons:
+
+            try:
+                if not button.is_displayed():
+                    continue
+
+                driver.execute_script(
+                    "arguments[0].click();",
+                    button
+                )
+
+                try:
+                    WebDriverWait(
+                        driver,
+                        5
+                    ).until(
+                        EC.invisibility_of_element_located(
+                            (
+                                By.CSS_SELECTOR,
+                                (
+                                    "#side-panel."
+                                    "side-panel-is-expanded"
+                                )
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
+
+                time.sleep(
+                    0.5
+                )
+
+                return True
+
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    # ESC fallback
 
     try:
-
         driver.find_element(
             By.TAG_NAME,
             "body"
@@ -1745,7 +1403,7 @@ def close_author_panel(
         )
 
         time.sleep(
-            0.6
+            0.5
         )
 
     except Exception:
@@ -1755,13 +1413,65 @@ def close_author_panel(
 
 
 # ============================================================
-# EXTRACT AUTHORS + EMAILS
+# OPEN AUTHOR PANEL
+# ============================================================
+
+def open_author_panel(
+    driver,
+    author_index
+):
+    """
+    Re-fetches the button because React frequently rebuilds
+    author DOM nodes.
+    """
+
+    buttons = get_author_buttons(
+        driver
+    )
+
+    if author_index >= len(
+        buttons
+    ):
+        return None
+
+    button = buttons[
+        author_index
+    ]
+
+    try:
+        driver.execute_script(
+            """
+            arguments[0].scrollIntoView({
+                block: 'center'
+            });
+            """,
+            button
+        )
+
+        time.sleep(
+            0.5
+        )
+
+        driver.execute_script(
+            "arguments[0].click();",
+            button
+        )
+
+    except Exception:
+        return None
+
+    return wait_for_author_panel(
+        driver
+    )
+
+
+# ============================================================
+# EXTRACT ARTICLE AUTHORS
 # ============================================================
 
 def extract_article_authors(
     driver
 ):
-
     results = []
 
     initial_buttons = (
@@ -1783,18 +1493,13 @@ def extract_article_authors(
         total_authors
     ):
 
-        # Re-fetch because React can change DOM.
-
-        buttons = (
-            get_author_buttons(
-                driver
-            )
+        buttons = get_author_buttons(
+            driver
         )
 
         if index >= len(
             buttons
         ):
-
             break
 
         button = buttons[
@@ -1822,8 +1527,8 @@ def extract_article_authors(
 
         print()
         print(
-            f"      "
-            f"[{index + 1}/{total_authors}] "
+            f"      [{index + 1}/"
+            f"{total_authors}] "
             f"{author_name} "
             f"({author_id})"
         )
@@ -1837,8 +1542,10 @@ def extract_article_authors(
 
         affiliation = ""
 
+        correspondence_address = ""
+
         # ----------------------------------------------------
-        # AUTHORS WITHOUT CONTACT ICON
+        # NO CONTACT ICON
         # ----------------------------------------------------
 
         if not has_contact_icon:
@@ -1858,6 +1565,9 @@ def extract_article_authors(
                     "affiliation":
                         "",
 
+                    "correspondence_address":
+                        "",
+
                     "has_contact_icon":
                         "No",
 
@@ -1869,82 +1579,56 @@ def extract_article_authors(
             continue
 
         # ----------------------------------------------------
-        # AUTHORS WITH ENVELOPE ICON
+        # CONTACT AUTHOR
         # ----------------------------------------------------
 
+        panel = None
+
         try:
-
-            driver.execute_script(
-                """
-                arguments[0].scrollIntoView({
-                    block: 'center',
-                    behavior: 'instant'
-                });
-                """,
-                button
-            )
-
-            time.sleep(
-                0.5
-            )
-
-            # Click
-
-            try:
-
-                button.click()
-
-            except (
-                ElementClickInterceptedException,
-                StaleElementReferenceException
-            ):
-
-                buttons = (
-                    get_author_buttons(
-                        driver
-                    )
-                )
-
-                if index >= len(
-                    buttons
-                ):
-
-                    raise RuntimeError(
-                        "Author button disappeared."
-                    )
-
-                button = (
-                    buttons[
-                        index
-                    ]
-                )
-
-                driver.execute_script(
-                    "arguments[0].click();",
-                    button
-                )
-
-            except Exception:
-
-                driver.execute_script(
-                    "arguments[0].click();",
-                    button
-                )
-
             print(
-                "          Waiting for author panel..."
+                "          Clicking author..."
             )
 
-            panel = (
-                wait_for_author_panel(
-                    driver
-                )
+            panel = open_author_panel(
+                driver,
+                index
             )
+
+            # ------------------------------------------------
+            # RETRY ONCE
+            # ------------------------------------------------
 
             if panel is None:
 
                 print(
-                    "          Panel did not appear."
+                    "          First click did not open panel."
+                )
+
+                close_author_panel(
+                    driver
+                )
+
+                time.sleep(
+                    1
+                )
+
+                print(
+                    "          Retrying..."
+                )
+
+                panel = open_author_panel(
+                    driver,
+                    index
+                )
+
+            # ------------------------------------------------
+            # PANEL OPEN
+            # ------------------------------------------------
+
+            if panel is None:
+
+                print(
+                    "          PANEL NOT FOUND"
                 )
 
             else:
@@ -1953,14 +1637,38 @@ def extract_article_authors(
                     "          Panel opened."
                 )
 
+                # --------------------------------------------
+                # AUTHOR NAME FROM PANEL
+                # --------------------------------------------
+
+                panel_author = (
+                    extract_panel_author_name(
+                        driver
+                    )
+                )
+
+                if panel_author:
+
+                    author_name = (
+                        panel_author
+                    )
+
+                    print(
+                        f"          Panel author: "
+                        f"{panel_author}"
+                    )
+
+                # --------------------------------------------
+                # EMAIL
+                # --------------------------------------------
+
                 print(
                     "          Waiting for email..."
                 )
 
-                email, panel = (
+                email = (
                     wait_for_author_email(
-                        driver,
-                        panel
+                        driver
                     )
                 )
 
@@ -1971,25 +1679,43 @@ def extract_article_authors(
                         f"{email}"
                     )
 
-                    affiliation = (
-                        extract_affiliation_from_panel(
-                            panel,
-                            author_name,
-                            email
-                        )
-                    )
-
                 else:
 
                     print(
-                        "          EMAIL NOT FOUND "
-                        "after timeout."
+                        "          EMAIL NOT FOUND"
                     )
+
+                # --------------------------------------------
+                # AFFILIATION
+                # --------------------------------------------
+
+                affiliation = (
+                    extract_panel_affiliation(
+                        driver
+                    )
+                )
+
+                if affiliation:
+
+                    print(
+                        f"          Affiliation: "
+                        f"{affiliation[:120]}"
+                    )
+
+                # --------------------------------------------
+                # CORRESPONDENCE ADDRESS
+                # --------------------------------------------
+
+                correspondence_address = (
+                    extract_correspondence_address(
+                        driver
+                    )
+                )
 
         except Exception as exc:
 
             print(
-                f"          PANEL ERROR: "
+                f"          AUTHOR ERROR: "
                 f"{exc}"
             )
 
@@ -2014,6 +1740,9 @@ def extract_article_authors(
                 "affiliation":
                     affiliation,
 
+                "correspondence_address":
+                    correspondence_address,
+
                 "has_contact_icon":
                     "Yes",
 
@@ -2026,7 +1755,7 @@ def extract_article_authors(
 
 
 # ============================================================
-# PARSE ARTICLE
+# ARTICLE PARSER
 # ============================================================
 
 def parse_article(
@@ -2035,7 +1764,6 @@ def parse_article(
     journal,
     issue_metadata
 ):
-
     print()
     print(
         "-" * 100
@@ -2049,17 +1777,13 @@ def parse_article(
         driver,
         article_url
     ):
-
         return []
-
-    # Allow React components to initialize.
 
     time.sleep(
         1
     )
 
     try:
-
         WebDriverWait(
             driver,
             10
@@ -2075,19 +1799,17 @@ def parse_article(
     except TimeoutException:
         pass
 
-    title = (
-        extract_article_title(
-            driver
-        )
+    title = extract_article_title(
+        driver
     )
 
-    metadata = (
-        extract_article_metadata(
-            driver
-        )
+    metadata = extract_article_metadata(
+        driver
     )
 
-    # Fall back to issue metadata
+    # --------------------------------------------------------
+    # FALLBACKS FROM ISSUE
+    # --------------------------------------------------------
 
     if not metadata[
         "journal"
@@ -2173,10 +1895,8 @@ def parse_article(
         f"{metadata['doi']}"
     )
 
-    authors = (
-        extract_article_authors(
-            driver
-        )
+    authors = extract_article_authors(
+        driver
     )
 
     rows = []
@@ -2228,6 +1948,11 @@ def parse_article(
                         "affiliation"
                     ],
 
+                "correspondence_address":
+                    author[
+                        "correspondence_address"
+                    ],
+
                 "has_contact_icon":
                     author[
                         "has_contact_icon"
@@ -2256,7 +1981,6 @@ def parse_article(
 # ============================================================
 
 def load_checkpoint():
-
     data = load_json(
         CHECKPOINT_FILE
     )
@@ -2283,7 +2007,6 @@ def save_checkpoint(
     records,
     completed_articles
 ):
-
     save_json(
         CHECKPOINT_FILE,
         {
@@ -2303,13 +2026,89 @@ def save_checkpoint(
 
 
 # ============================================================
+# CHECK WHETHER ARTICLE NEEDS REPROCESSING
+# ============================================================
+
+def article_needs_reprocess(
+    article_url,
+    records
+):
+    """
+    Reprocess an already-completed article when a contact
+    author was detected but its email remained blank.
+    """
+
+    matching = [
+        row
+        for row in records
+        if normalize_url(
+            row.get(
+                "article_url",
+                ""
+            )
+        ) == normalize_url(
+            article_url
+        )
+    ]
+
+    if not matching:
+        return True
+
+    for row in matching:
+
+        if (
+            str(
+                row.get(
+                    "has_contact_icon",
+                    ""
+                )
+            ).strip().lower()
+            == "yes"
+            and
+            not str(
+                row.get(
+                    "email",
+                    ""
+                )
+            ).strip()
+        ):
+
+            return True
+
+    return False
+
+
+# ============================================================
+# REMOVE OLD ARTICLE RECORDS BEFORE REPROCESS
+# ============================================================
+
+def remove_article_records(
+    records,
+    article_url
+):
+    article_url = normalize_url(
+        article_url
+    )
+
+    return [
+        row
+        for row in records
+        if normalize_url(
+            row.get(
+                "article_url",
+                ""
+            )
+        ) != article_url
+    ]
+
+
+# ============================================================
 # SAVE EXCEL
 # ============================================================
 
 def save_excel(
     records
 ):
-
     if not records:
 
         print(
@@ -2332,6 +2131,7 @@ def save_excel(
         "author",
         "email",
         "affiliation",
+        "correspondence_address",
         "has_contact_icon",
         "author_id",
         "doi",
@@ -2384,7 +2184,7 @@ def save_excel(
     )
 
     # --------------------------------------------------------
-    # DUPLICATES
+    # REMOVE DUPLICATES
     # --------------------------------------------------------
 
     df.drop_duplicates(
@@ -2393,12 +2193,12 @@ def save_excel(
             "author",
             "email",
         ],
-        keep="first",
+        keep="last",
         inplace=True
     )
 
     # --------------------------------------------------------
-    # AUTHORS WITH EMAIL
+    # EMAIL SHEET
     # --------------------------------------------------------
 
     email_df = (
@@ -2446,7 +2246,7 @@ def save_excel(
     )
 
     # --------------------------------------------------------
-    # WRITE
+    # WRITE EXCEL
     # --------------------------------------------------------
 
     with pd.ExcelWriter(
@@ -2478,10 +2278,11 @@ def save_excel(
             "G": 35,
             "H": 45,
             "I": 85,
-            "J": 20,
-            "K": 15,
-            "L": 38,
-            "M": 90,
+            "J": 100,
+            "K": 20,
+            "L": 15,
+            "M": 38,
+            "N": 90,
         }
 
         for sheet_name in [
@@ -2489,11 +2290,9 @@ def save_excel(
             "Authors With Email",
         ]:
 
-            worksheet = (
-                workbook[
-                    sheet_name
-                ]
-            )
+            worksheet = workbook[
+                sheet_name
+            ]
 
             worksheet.freeze_panes = (
                 "A2"
@@ -2534,7 +2333,6 @@ def save_excel(
 # ============================================================
 
 def main():
-
     os.makedirs(
         OUTPUT_FOLDER,
         exist_ok=True
@@ -2552,7 +2350,6 @@ def main():
         errors,
         list
     ):
-
         errors = []
 
     print(
@@ -2581,9 +2378,7 @@ def main():
 
     print()
 
-    driver = (
-        connect_to_chrome()
-    )
+    driver = connect_to_chrome()
 
     try:
 
@@ -2624,11 +2419,9 @@ def main():
             # ISSUES
             # ------------------------------------------------
 
-            issue_links = (
-                extract_issue_links(
-                    driver,
-                    journal
-                )
+            issue_links = extract_issue_links(
+                driver,
+                journal
             )
 
             print(
@@ -2662,7 +2455,6 @@ def main():
                         issue_url,
                         ISSUE_LOAD_WAIT
                     ):
-
                         continue
 
                     issue_metadata = (
@@ -2704,13 +2496,11 @@ def main():
                     if issue_year:
 
                         try:
-
                             issue_year_int = int(
                                 issue_year
                             )
 
                         except Exception:
-
                             issue_year_int = None
 
                         if (
@@ -2765,9 +2555,26 @@ def main():
                             )
                         )
 
-                        if (
+                        # ====================================
+                        # COMPLETED / REPROCESS DECISION
+                        # ====================================
+
+                        already_completed = (
                             article_url
                             in completed_articles
+                        )
+
+                        needs_reprocess = (
+                            article_needs_reprocess(
+                                article_url,
+                                records
+                            )
+                        )
+
+                        if (
+                            already_completed
+                            and
+                            not needs_reprocess
                         ):
 
                             print(
@@ -2779,12 +2586,40 @@ def main():
 
                             continue
 
-                        print()
-                        print(
-                            f"[Article "
-                            f"{article_index}/"
-                            f"{len(article_urls)}]"
-                        )
+                        if (
+                            already_completed
+                            and
+                            needs_reprocess
+                        ):
+
+                            print()
+                            print(
+                                f"[Article "
+                                f"{article_index}/"
+                                f"{len(article_urls)}] "
+                                f"REPROCESSING - "
+                                f"missing contact email"
+                            )
+
+                            records = (
+                                remove_article_records(
+                                    records,
+                                    article_url
+                                )
+                            )
+
+                            completed_articles.discard(
+                                article_url
+                            )
+
+                        else:
+
+                            print()
+                            print(
+                                f"[Article "
+                                f"{article_index}/"
+                                f"{len(article_urls)}]"
+                            )
 
                         try:
 
@@ -2816,24 +2651,22 @@ def main():
                                 if record_year:
 
                                     try:
-
-                                        record_year = int(
+                                        record_year_int = int(
                                             record_year
                                         )
 
                                     except Exception:
-
-                                        record_year = None
+                                        record_year_int = None
 
                                     if (
-                                        record_year
+                                        record_year_int
                                         and
                                         not (
                                             journal[
                                                 "start_year"
                                             ]
                                             <=
-                                            record_year
+                                            record_year_int
                                             <=
                                             journal[
                                                 "end_year"
@@ -2847,10 +2680,6 @@ def main():
                                     record
                                 )
 
-                            # --------------------------------
-                            # ADD RECORDS
-                            # --------------------------------
-
                             records.extend(
                                 accepted_records
                             )
@@ -2860,7 +2689,7 @@ def main():
                             )
 
                             # --------------------------------
-                            # CHECKPOINT AFTER EVERY ARTICLE
+                            # CHECKPOINT
                             # --------------------------------
 
                             save_checkpoint(
@@ -2869,14 +2698,16 @@ def main():
                             )
 
                             # --------------------------------
-                            # EXCEL EVERY 10 ARTICLES
+                            # PERIODIC EXCEL
                             # --------------------------------
 
                             if (
                                 len(
                                     completed_articles
                                 )
-                                % 10 == 0
+                                %
+                                SAVE_EVERY_N_ARTICLES
+                                == 0
                             ):
 
                                 save_excel(
